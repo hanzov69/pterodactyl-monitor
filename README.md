@@ -22,6 +22,24 @@ Nodes are discovered from the panel API each cycle, so added/removed nodes are
 picked up automatically. Nodes in maintenance mode are shown but not alerted on.
 If the API is unreachable, the last known node list keeps being checked.
 
+### TLS certificates
+
+Where the panel or a node is checked over https, the monitor also reads the
+expiry date of the certificate that was presented and shows the days left next
+to the target. One notice per certificate (a dashboard event and an email) is
+raised when that falls to `CERT_WARN_DAYS` (default 14; 0 turns the warning
+off). An expired certificate fails the check itself, so the target goes DOWN
+with the reason `TLS certificate expired on <date>`.
+
+This is the certificate being served, which is what clients such as the panel
+see, not the file on disk. Wings reads its certificate when it starts: after a
+renewal it keeps presenting the old one until it is restarted, and once that
+expires the panel can no longer reach the node. A shrinking "days left" on a
+node whose certificate you know was renewed means Wings needs a restart
+(`systemctl restart wings`; game servers keep running).
+
+### Alerts
+
 A target is **DOWN** after `FAIL_THRESHOLD` (default 3) consecutive failures.
 One email is sent on DOWN and one on recovery; changes in the same cycle are
 combined into a single message, and failed sends are retried each cycle.
@@ -76,6 +94,7 @@ else are rejected. Don't put it behind an internet-facing Ingress.
 | `PANEL_API_KEY` | – | Application API key (`ptla_`). Without it, nodes aren't monitored |
 | `LAN_TLS_SKIP_VERIFY`, `NODE_TLS_SKIP_VERIFY` | `false` | For mismatched / self-signed certs |
 | `CHECK_INTERVAL`, `CHECK_TIMEOUT`, `FAIL_THRESHOLD` | `60s`, `10s`, `3` | |
+| `CERT_WARN_DAYS` | `14` | Warn when a panel or node certificate has this many days left; `0` turns it off |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS` | –, `587`, `starttls` | `SMTP_TLS`: `starttls`, `tls`, `none` |
 | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TO` | – | `SMTP_TO` may be comma-separated |
 | `DASHBOARD_URL` | – | Link appended to alert emails |

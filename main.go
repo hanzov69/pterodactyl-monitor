@@ -27,6 +27,7 @@ type Config struct {
 	ClientKey     string
 	ServerChecks  map[string]ProbeSpec
 	StartGrace    time.Duration
+	CertWarn      time.Duration
 	LANInsecure   bool
 	NodeInsecure  bool
 	Interval      time.Duration
@@ -90,6 +91,11 @@ func loadConfig() Config {
 	if c.APIURL == "" {
 		c.APIURL = c.PublicURL
 	}
+	warnDays, err := strconv.Atoi(env("CERT_WARN_DAYS", "14"))
+	if err != nil || warnDays < 0 {
+		log.Fatalf("CERT_WARN_DAYS: must be a number of days (0 turns the warning off)")
+	}
+	c.CertWarn = time.Duration(warnDays) * 24 * time.Hour
 	n, err := strconv.Atoi(env("FAIL_THRESHOLD", "3"))
 	if err != nil || n < 1 {
 		log.Fatalf("FAIL_THRESHOLD: must be a positive integer")

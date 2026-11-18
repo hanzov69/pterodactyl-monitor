@@ -57,6 +57,7 @@
   .sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .tag { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 500;
     line-height: 17px; color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--border); vertical-align: 1px; white-space: nowrap; }
+  .tag .ico { width: 12px; height: 12px; font-size: 8px; margin-right: 4px; vertical-align: -2px; }
   .right { display: flex; gap: 20px; text-align: right; white-space: nowrap; }
   .target.muted .name, .target.muted .pct { color: var(--ink-2); }
 
@@ -176,6 +177,16 @@ function display(t) {
   return { cls: "idle", label: cap(String(t.status).replace(/_/g, " ")) }; // suspended, installing, ...
 }
 
+// Days left on the TLS certificate a target presented; flagged once inside the warning window.
+function certTag(t, s, now) {
+  if (!t.certExpiry) return "";
+  const left = Math.floor((new Date(t.certExpiry).getTime() - now) / 86400000);
+  const on = new Date(t.certExpiry).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  if (left < 0) return `<span class="tag" title="Expired ${esc(on)}">${ico("down")}certificate expired</span>`;
+  const text = `certificate: ${left} day${left === 1 ? "" : "s"} left`;
+  return `<span class="tag" title="Expires ${esc(on)}">${s.certWarnDays && left <= s.certWarnDays ? ico("failing") : ""}${text}</span>`;
+}
+
 function cellClass(c) {
   if (!c.total) return "";
   if (c.up === c.total) return "good";
@@ -223,7 +234,7 @@ function render(s) {
     const d = display(t);
     const since = t.status === "unknown" || t.stale ? "" : ` for ${dur((now - new Date(t.since).getTime()) / 1000)}`;
     const info = [t.node ? `on ${t.node}` : "", t.url, t.detail, t.note, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
-    const tags = (t.tags || []).map(x => `<span class="tag">${esc(x)}</span>`).join("");
+    const tags = (t.tags || []).map(x => `<span class="tag">${esc(x)}</span>`).join("") + certTag(t, s, now);
     const strip = t.cells.map((c, ci) => { cells[`${ti}:${ci}`] = c; return `<div class="cell ${cellClass(c)}" data-c="${ti}:${ci}"></div>`; }).join("");
     return `<div class="target${t.alerts ? "" : " muted"}">
       <div class="row">
@@ -241,8 +252,8 @@ function render(s) {
   }).join("") || `<div class="empty">${empty}</div>`;
 
   document.getElementById("events").innerHTML = s.events.length ? "<table>" + s.events.slice(0, 30).map(e => {
-    const st = e.type === "down" ? "down" : "up";
-    const what = e.type === "down" ? "went down" : `recovered after ${dur(e.durationSec || 0)}`;
+    const st = e.type === "down" ? "down" : e.type === "up" ? "up" : "failing";
+    const what = e.type === "down" ? "went down" : e.type === "up" ? `recovered after ${dur(e.durationSec || 0)}` : "";
     return `<tr><td class="when">${dtf.format(new Date(e.time))}</td>
       <td>${ico(st)} <b>${esc(e.name)}</b> ${what}<div class="sub">${esc(e.detail)}</div></td></tr>`;
   }).join("") + "</table>" : `<div class="empty">No outages recorded.</div>`;

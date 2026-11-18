@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,6 +109,11 @@ type State struct {
 	// has passed at least once; see checkServer.
 	ProbeKey       string `json:"probeKey,omitempty"`
 	ProbeConfirmed bool   `json:"probeConfirmed,omitempty"`
+
+	// Expiry of the TLS certificate the target presented on its last check
+	// (panel and node checks over https), and the expiry we last warned about.
+	CertExpiry time.Time `json:"certExpiry,omitzero"`
+	CertWarned time.Time `json:"certWarned,omitzero"`
 }
 
 type Bucket struct {
@@ -155,7 +161,8 @@ type result struct {
 	ms          int64
 	detail      string
 	power       string
-	probePassed bool // the server's service check ran and passed
+	probePassed bool      // the server's service check ran and passed
+	certExpiry  time.Time // expiry of the TLS certificate presented, if any
 }
 
 func okResult(ms int64, detail string) result   { return result{kind: resOK, ms: ms, detail: detail} }
@@ -411,6 +418,7 @@ func (m *Monitor) apply(t Target, r result, now time.Time) {
 		return
 	}
 	st.LatencyMs = r.ms
+	m.trackCert(t, st, r, now)
 
 	// A server may sit in "starting" for a while; past the grace period that is a failure.
 	if r.kind == resPending {
@@ -616,9 +624,18 @@ func (m *Monitor) prune() {
 // ---- panel and node checks ----
 
 func (m *Monitor) get(ctx context.Context, skipVerify bool, rawURL string, hdr map[string]string) (int, []byte, int64, error) {
+	code, body, ms, _, err := m.getx(ctx, skipVerify, rawURL, hdr)
+	return code, body, ms, err
+}
+
+// getx is get plus the expiry date of the TLS certificate the server
+// presented (zero for plain http). The date is also recovered when the
+// request fails because that certificate did not verify, e.g. it has expired.
+func (m *Monitor) getx(ctx context.Context, skipVerify bool, rawURL string, hdr map[string]string) (int, []byte, int64, time.Time, error) {
+	var expiry time.Time
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, 0, expiry, err
 	}
 	req.Header.Set("User-Agent", userAgent)
 	for k, v := range hdr {
@@ -631,11 +648,65 @@ func (m *Monitor) get(ctx context.Context, skipVerify bool, rawURL string, hdr m
 	start := time.Now()
 	resp, err := cl.Do(req)
 	if err != nil {
-		return 0, nil, time.Since(start).Milliseconds(), err
+		var cve *tls.CertificateVerificationError
+		if errors.As(err, &cve) && len(cve.UnverifiedCertificates) > 0 {
+			expiry = cve.UnverifiedCertificates[0].NotAfter
+		}
+		return 0, nil, time.Since(start).Milliseconds(), expiry, err
 	}
 	defer resp.Body.Close()
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		expiry = resp.TLS.PeerCertificates[0].NotAfter
+	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	return resp.StatusCode, body, time.Since(start).Milliseconds(), nil
+	return resp.StatusCode, body, time.Since(start).Milliseconds(), expiry, nil
+}
+
+// trackCert remembers when a target's certificate expires and raises one
+// notice per certificate once that is closer than CERT_WARN_DAYS. It reports
+// what the service is serving right now, which is what its clients see: a
+// daemon that was not restarted after a renewal keeps presenting the old one.
+// Caller holds m.mu.
+func (m *Monitor) trackCert(t Target, st *State, r result, now time.Time) {
+	if r.certExpiry.IsZero() {
+		if r.kind == resOK { // answered without TLS
+			st.CertExpiry = time.Time{}
+		}
+		return
+	}
+	st.CertExpiry = r.certExpiry
+	left := r.certExpiry.Sub(now)
+	if m.cfg.CertWarn <= 0 || left > m.cfg.CertWarn || st.CertWarned.Equal(r.certExpiry) {
+		return
+	}
+	st.CertWarned = r.certExpiry
+	on := r.certExpiry.Local().Format("2006-01-02")
+	what := "TLS certificate expired on " + on
+	if left > 0 {
+		what = fmt.Sprintf("TLS certificate expires in %s, on %s", days(left), on)
+	}
+	m.event(Event{Time: now, TargetID: t.ID, Name: t.Label(), Type: "notice", Detail: what})
+	m.notify(now, "CERTIFICATE: "+t.Label(), fmt.Sprintf(
+		"%s: %s\n\nURL: %s\n\nThis is the certificate the service is presenting right now. If it was renewed\n"+
+			"on disk but the service has not been restarted since, restarting the service is\nusually all that is needed.\n",
+		t.Label(), what, t.URL))
+}
+
+func days(d time.Duration) string {
+	n := int(d.Hours() / 24)
+	if n == 1 {
+		return "1 day"
+	}
+	return fmt.Sprintf("%d days", n)
+}
+
+// failDetail describes a failed request, naming an expired certificate plainly.
+func failDetail(err error, certExpiry time.Time) string {
+	var inv x509.CertificateInvalidError
+	if errors.As(err, &inv) && inv.Reason == x509.Expired && !certExpiry.IsZero() && certExpiry.Before(time.Now()) {
+		return "TLS certificate expired on " + certExpiry.Local().Format("2006-01-02")
+	}
+	return errDetail(err)
 }
 
 func errDetail(err error) string {
@@ -654,14 +725,16 @@ func errDetail(err error) string {
 }
 
 func (m *Monitor) checkPanel(ctx context.Context, u string, skipVerify bool) result {
-	code, _, ms, err := m.get(ctx, skipVerify, u, nil)
-	if err != nil {
-		return failResult(ms, errDetail(err))
+	code, _, ms, cert, err := m.getx(ctx, skipVerify, u, nil)
+	r := okResult(ms, fmt.Sprintf("HTTP %d", code))
+	switch {
+	case err != nil:
+		r = failResult(ms, failDetail(err, cert))
+	case code >= 400:
+		r = failResult(ms, fmt.Sprintf("HTTP %d", code))
 	}
-	if code >= 400 {
-		return failResult(ms, fmt.Sprintf("HTTP %d", code))
-	}
-	return okResult(ms, fmt.Sprintf("HTTP %d", code))
+	r.certExpiry = cert
+	return r
 }
 
 func bearer(key string) map[string]string {
@@ -729,15 +802,16 @@ type pageMeta struct {
 // checkNode asks the node's Wings daemon for anything at all. Wings answers
 // 401 to requests without its daemon token, which is enough to know it is alive.
 func (m *Monitor) checkNode(ctx context.Context, n Target) result {
-	code, _, ms, err := m.get(ctx, m.cfg.NodeInsecure, n.URL+"/api/system", map[string]string{"Accept": "application/json"})
+	code, _, ms, cert, err := m.getx(ctx, m.cfg.NodeInsecure, n.URL+"/api/system", map[string]string{"Accept": "application/json"})
+	r := okResult(ms, "Wings responding")
 	switch {
 	case err != nil:
-		return failResult(ms, errDetail(err))
-	case code == 200 || code == 401 || code == 403:
-		return okResult(ms, "Wings responding")
-	default:
-		return failResult(ms, fmt.Sprintf("HTTP %d from Wings", code))
+		r = failResult(ms, failDetail(err, cert))
+	case code != 200 && code != 401 && code != 403:
+		r = failResult(ms, fmt.Sprintf("HTTP %d from Wings", code))
 	}
+	r.certExpiry = cert
+	return r
 }
 
 // ---- dashboard snapshot ----
@@ -767,6 +841,7 @@ type Snapshot struct {
 	Events      []Event      `json:"events"`
 	EmailOn     bool         `json:"emailEnabled"`
 	ServersOn   bool         `json:"serversEnabled"`
+	CertWarn    int          `json:"certWarnDays"`
 }
 
 var ranges = map[string]struct {
@@ -790,7 +865,8 @@ func (m *Monitor) Snapshot(rng string) Snapshot {
 	s := Snapshot{
 		Generated: now, LastCycle: m.lastCycle, IntervalSec: int(m.cfg.Interval.Seconds()),
 		Range: rng, CellSec: r.cellSec, EmailOn: m.cfg.SMTP.Enabled(), ServersOn: m.cfg.ClientKey != "",
-		Targets: []TargetView{}, Events: []Event{},
+		CertWarn: int(m.cfg.CertWarn.Hours() / 24),
+		Targets:  []TargetView{}, Events: []Event{},
 	}
 	for i := len(m.d.Events) - 1; i >= 0; i-- {
 		s.Events = append(s.Events, m.d.Events[i])
