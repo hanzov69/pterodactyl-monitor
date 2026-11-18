@@ -3,6 +3,10 @@
 Small Go service that watches a Pterodactyl install, emails you when something
 goes down (and when it recovers), and serves a status page with rolling uptime.
 
+Out of the box it monitors the panel and its nodes. Monitoring the individual
+servers on the panel is an [optional add-on](#optional-server-monitoring) that
+stays completely out of the way until you give it a key.
+
 ## What it checks
 
 Every `CHECK_INTERVAL` (default 60s):
@@ -12,7 +16,7 @@ Every `CHECK_INTERVAL` (default 60s):
 | Panel (public) | `GET PANEL_PUBLIC_URL` | HTTP status < 400 |
 | Panel (LAN) | `GET PANEL_LAN_URL` | HTTP status < 400 |
 | Panel API | `GET /api/application/nodes` with the API key | HTTP 200 |
-| Each node | `GET <scheme>://<fqdn>:<daemon port>/api/system` (Wings) | Wings answers (200, or 401/403 if the daemon token couldn't be read) |
+| Each node | `GET <scheme>://<fqdn>:<daemon port>/api/system` (Wings) | Wings answers (a 401 without its token still proves it is alive) |
 
 Nodes are discovered from the panel API each cycle, so added/removed nodes are
 picked up automatically. Nodes in maintenance mode are shown but not alerted on.
@@ -69,13 +73,69 @@ else are rejected. Don't put it behind an internet-facing Ingress.
 |---|---|---|
 | `PANEL_PUBLIC_URL`, `PANEL_LAN_URL` | – | At least one required |
 | `PANEL_API_URL` | LAN URL | Where to reach the application API |
-| `PANEL_API_KEY` | – | Without it, nodes aren't monitored |
+| `PANEL_API_KEY` | – | Application API key (`ptla_`). Without it, nodes aren't monitored |
 | `LAN_TLS_SKIP_VERIFY`, `NODE_TLS_SKIP_VERIFY` | `false` | For mismatched / self-signed certs |
 | `CHECK_INTERVAL`, `CHECK_TIMEOUT`, `FAIL_THRESHOLD` | `60s`, `10s`, `3` | |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS` | –, `587`, `starttls` | `SMTP_TLS`: `starttls`, `tls`, `none` |
 | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TO` | – | `SMTP_TO` may be comma-separated |
 | `DASHBOARD_URL` | – | Link appended to alert emails |
 | `DATA_DIR`, `LISTEN_ADDR` | `/data`, `:8080` | |
+
+## Optional: server monitoring
+
+| Variable | Default | |
+|---|---|---|
+| `PANEL_CLIENT_KEY` | – | Account API key (`ptlc_`). Setting it turns server monitoring on |
+| `SERVER_CHECKS` | – | Per-server service checks (JSON, see below) |
+| `START_GRACE` | `15m` | How long a server may be starting/stopping before it counts as failing |
+
+Everything in this section is off unless `PANEL_CLIENT_KEY` is set. Without
+it the monitor makes no server-related API calls and the dashboard shows only
+the panel and nodes.
+
+Set `PANEL_CLIENT_KEY` to an **account** API key (`ptlc_...`, Account → API
+Credentials) and the dashboard gains a **Servers** tab listing every server
+with its own uptime history. An admin's key sees every server on the panel; a
+regular user's key sees the servers that user owns or is a subuser of. The
+monitor only reads with it, but the key itself can do whatever its account
+can, so treat it accordingly.
+
+Each server's power state (running / starting / stopping / offline) comes from
+the panel. A running server can also get a service check:
+
+| Check | What it does | Chosen automatically for |
+|---|---|---|
+| `a2s` | Steam server query (what the in-game server browser sends); reports players and map | Rust (on its query port), Source-engine servers |
+| `http` | `GET` a URL, up when status < 400 | nginx / Apache / Caddy style web servers, on the primary allocation |
+| `tcp` | Connects to a port | - |
+| `none` | Power state only | Everything else |
+
+Override or add checks per server with `SERVER_CHECKS`, a JSON object keyed by
+server name, short id or UUID:
+
+```
+SERVER_CHECKS={"My Website":{"type":"http","url":"https://www.example.com"},"1a2b3c4d":{"type":"tcp","port":25565},"Some Bot":{"type":"none"}}
+```
+
+`host` and `port` default to the server's primary allocation.
+
+How a server's status is decided:
+
+- **offline**, or running with a failing service check, counts as a failed check.
+- **starting / stopping** is not a failure until it has lasted longer than
+  `START_GRACE` (default 15m), so restarts don't alert but a server stuck
+  booting does.
+- A server that is already off when the monitor first sees it is shown as
+  offline without being reported; it is only treated as an outage once it has
+  been seen running.
+- Suspended and installing servers are shown but never alerted on.
+- If the panel can't report a server's state (node unreachable), the service
+  check decides on its own; without one the server is shown as unknown.
+
+Each server row has an **alerts** switch. Switching it off stops emails for
+that server (it is still checked, charted and listed under recent events) and
+keeps it out of the headline status. The dashboard has no login: anyone who
+can reach it can flip these switches, so keep it on a trusted network.
 
 ## Run locally
 

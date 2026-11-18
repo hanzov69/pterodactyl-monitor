@@ -31,7 +31,17 @@
     font-size: 16px; font-weight: 600; }
   .banner small { display: block; font-size: 12px; font-weight: 400; color: var(--ink-2); }
 
-  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
+  .tabs[hidden] { display: none; }
+  .tabs { display: flex; gap: 4px; margin-top: 22px; border-bottom: 1px solid var(--hairline); }
+  .tabs button { all: unset; cursor: pointer; padding: 8px 12px; font-size: 14px; font-weight: 600; color: var(--muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px; display: inline-flex; align-items: center; gap: 8px; }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+  .tabs button:focus-visible { outline: 2px solid var(--ink-2); outline-offset: -2px; border-radius: 4px; }
+  .pill { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--empty); color: var(--ink-2); }
+  .pill:empty { display: none; }
+  .pill.bad { background: var(--critical); color: #fff; }
+
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; }
   .toolbar h2 { margin: 0; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
   .seg button { all: unset; cursor: pointer; padding: 5px 12px; font-size: 12px; color: var(--ink-2); }
@@ -45,7 +55,17 @@
   .row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
   .name { font-weight: 600; }
   .sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-  .right { text-align: right; white-space: nowrap; }
+  .right { display: flex; gap: 20px; text-align: right; white-space: nowrap; }
+  .target.muted .name, .target.muted .pct { color: var(--ink-2); }
+
+  .switch { all: unset; cursor: pointer; display: block; width: 32px; height: 18px; border-radius: 999px; margin: 2px 0 1px auto;
+    background: var(--empty); box-shadow: inset 0 0 0 1px var(--border); position: relative; transition: background .12s; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--surface); box-shadow: 0 0 0 1px var(--border); transition: transform .12s; }
+  .switch[aria-checked="true"] { background: var(--ink); }
+  .switch[aria-checked="true"]::after { transform: translateX(14px); }
+  .switch:focus-visible { outline: 2px solid var(--ink-2); outline-offset: 2px; }
+  .switch:disabled { opacity: .5; cursor: default; }
   .pct { font-weight: 600; font-variant-numeric: tabular-nums; }
 
   .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); margin-left: 8px; font-weight: 400; }
@@ -53,9 +73,9 @@
     font-size: 10px; font-weight: 700; line-height: 1; color: #fff; flex: none; }
   .banner .ico { width: 26px; height: 26px; font-size: 15px; }
   .ico.up { background: var(--good); }
-  .ico.failing { background: var(--warning); color: #0b0b0b; }
+  .ico.failing, .ico.starting { background: var(--warning); color: #0b0b0b; }
   .ico.down { background: var(--critical); }
-  .ico.maintenance, .ico.unknown { background: var(--muted); }
+  .ico.maintenance, .ico.unknown, .ico.idle { background: var(--muted); }
 
   .strip { display: flex; gap: 2px; height: 28px; margin-top: 10px; }
   .cell { flex: 1 1 0; min-width: 1px; border-radius: 2px; background: var(--empty); }
@@ -92,6 +112,11 @@
   </header>
   <div class="banner" id="banner"><span class="ico unknown">?</span><div>Loading…</div></div>
 
+  <div class="tabs" role="tablist" hidden>
+    <button role="tab" data-tab="infra">Infrastructure <span class="pill" id="pill-infra"></span></button>
+    <button role="tab" data-tab="servers">Servers <span class="pill" id="pill-servers"></span></button>
+  </div>
+
   <div class="toolbar">
     <h2>Uptime</h2>
     <div class="seg" role="group" aria-label="Time range">
@@ -113,17 +138,20 @@
 <div id="tip"></div>
 
 <script>
-const ICON = { up: "✓", failing: "!", down: "✕", maintenance: "–", unknown: "?" };
+const ICON = { up: "✓", failing: "!", starting: "↻", down: "✕", maintenance: "–", idle: "–", unknown: "?" };
 const LABEL = { up: "Up", failing: "Failing", down: "Down", maintenance: "Maintenance", unknown: "Pending" };
-let range = "24h";
+let range = "24h", tab = location.hash === "#servers" ? "servers" : "infra", last = null;
 try { range = localStorage.getItem("range") || range; } catch {}
 let cells = {}; // "targetIdx:cellIdx" -> tooltip data
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
 const ico = s => `<span class="ico ${s}" aria-hidden="true">${ICON[s] || "?"}</span>`;
 const pct = v => v == null ? "–" : (v >= 99.995 ? "100" : v.toFixed(v >= 99 ? 2 : 1)) + "%";
 const dtf = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const tf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const isOutage = t => t.status === "down" && (t.kind !== "server" || t.announced);
+const inTab = (t, which) => (t.kind === "server") === (which === "servers");
 
 function dur(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -134,6 +162,17 @@ function dur(sec) {
   return `${sec}s`;
 }
 
+// What to show for a target: icon class + label.
+function display(t) {
+  if (t.stale) return { cls: "unknown", label: "Unknown" };
+  if (t.status === "starting") return { cls: "starting", label: cap(t.power || "starting") };
+  // A server that was already off when first discovered is "off", not an outage.
+  if (t.status === "down" && t.kind === "server" && !t.announced) return { cls: "idle", label: t.power === "offline" ? "Offline" : "Down" };
+  if (t.status === "down" && t.power === "offline") return { cls: "down", label: "Offline" };
+  if (LABEL[t.status]) return { cls: t.status, label: LABEL[t.status] };
+  return { cls: "idle", label: cap(String(t.status).replace(/_/g, " ")) }; // suspended, installing, ...
+}
+
 function cellClass(c) {
   if (!c.total) return "";
   if (c.up === c.total) return "good";
@@ -142,37 +181,60 @@ function cellClass(c) {
 }
 
 function render(s) {
+  last = s;
   const now = new Date(s.generated).getTime();
-  const down = s.targets.filter(t => t.status === "down");
-  const failing = s.targets.filter(t => t.status === "failing");
-  const stale = s.lastCycle.startsWith("0001") ? false : now - new Date(s.lastCycle).getTime() > s.intervalSec * 3000 + 30000;
+  // Targets with alerts switched off don't count towards the headline.
+  const watched = s.targets.filter(t => t.alerts);
+  const down = watched.filter(isOutage);
+  const failing = watched.filter(t => t.status === "failing");
+  const mutedDown = s.targets.filter(t => !t.alerts && isOutage(t)).length;
+  const stale = s.lastCycle.startsWith("0001") ? false : now - new Date(s.lastCycle).getTime() > s.intervalSec * 3000 + 60000;
 
   let bs = "up", title = "All systems operational", sub = `${s.targets.length} checks, every ${dur(s.intervalSec)}`;
   if (!s.targets.some(t => t.lastCheck && !t.lastCheck.startsWith("0001"))) { bs = "unknown"; title = "Waiting for first check"; }
   if (failing.length) { bs = "failing"; title = "Checks failing"; sub = failing.map(t => t.name).join(", "); }
-  if (down.length) { bs = "down"; title = `${down.length} of ${s.targets.length} down`; sub = down.map(t => t.name).join(", "); }
+  if (down.length) { bs = "down"; title = `${down.length} of ${watched.length} down`; sub = down.map(t => t.name).join(", "); }
   if (stale) { bs = "failing"; title = "Monitor data is stale"; sub = "The check loop has not completed recently"; }
+  if (mutedDown) sub += ` · ${mutedDown} down with alerts off`;
   if (!s.emailEnabled) sub += " · email notifications are not configured";
   document.getElementById("banner").innerHTML = `${ico(bs)}<div>${esc(title)}<small>${esc(sub)}</small></div>`;
   document.getElementById("updated").textContent = "Updated " + tf.format(new Date(s.generated));
   document.title = (down.length ? `(${down.length} down) ` : "") + "Pterodactyl Status";
 
+  // Tabs (and everything server-related) only appear when server monitoring is enabled.
+  document.querySelector(".tabs").hidden = !s.serversEnabled;
+  if (!s.serversEnabled) tab = "infra";
+  for (const which of ["infra", "servers"]) {
+    const all = s.targets.filter(t => inTab(t, which)), bad = all.filter(t => t.alerts && isOutage(t)).length;
+    const pill = document.getElementById("pill-" + which);
+    pill.textContent = bad ? `${bad} down` : (all.length || "");
+    pill.className = "pill" + (bad ? " bad" : "");
+    document.querySelector(`.tabs [data-tab="${which}"]`).setAttribute("aria-selected", which === tab);
+  }
+
   cells = {};
-  const first = s.targets[0]?.cells[0];
-  document.getElementById("targets").innerHTML = s.targets.map((t, ti) => {
-    const since = t.status === "unknown" ? "" : ` for ${dur((now - new Date(t.since).getTime()) / 1000)}`;
-    const info = [t.url, t.detail, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
+  const shown = s.targets.filter(t => inTab(t, tab));
+  const first = shown[0]?.cells[0];
+  const empty = tab === "servers" ? "No servers found yet." : "No targets configured.";
+  document.getElementById("targets").innerHTML = shown.map((t, ti) => {
+    const d = display(t);
+    const since = t.status === "unknown" || t.stale ? "" : ` for ${dur((now - new Date(t.since).getTime()) / 1000)}`;
+    const info = [t.node ? `on ${t.node}` : "", t.url, t.detail, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
     const strip = t.cells.map((c, ci) => { cells[`${ti}:${ci}`] = c; return `<div class="cell ${cellClass(c)}" data-c="${ti}:${ci}"></div>`; }).join("");
-    return `<div class="target">
+    return `<div class="target${t.alerts ? "" : " muted"}">
       <div class="row">
-        <div><span class="name">${esc(t.name)}</span><span class="badge">${ico(t.status)}${LABEL[t.status] || esc(t.status)}${since}</span>
+        <div><span class="name">${esc(t.name)}</span><span class="badge">${ico(d.cls)}${esc(d.label)}${since}</span>
           <div class="sub">${info}</div></div>
-        <div class="right"><div class="pct">${pct(t.uptime[s.range])}</div><div class="sub">uptime</div></div>
+        <div class="right">
+          <div><div class="pct">${pct(t.uptime[s.range])}</div><div class="sub">uptime</div></div>
+          ${t.kind === "server" ? `<div><button class="switch" role="switch" aria-checked="${t.alerts}" data-alert="${esc(t.id)}"
+            aria-label="Email alerts for ${esc(t.name)}" title="Email alerts ${t.alerts ? "on" : "off"}"></button><div class="sub">alerts</div></div>` : ""}
+        </div>
       </div>
       <div class="strip" role="img" aria-label="${esc(t.name)} uptime over the last ${s.range}: ${pct(t.uptime[s.range])}">${strip}</div>
       <div class="axis"><span>${first ? dtf.format(new Date(first.t * 1000)) : ""}</span><span>now</span></div>
     </div>`;
-  }).join("") || `<div class="empty">No targets configured.</div>`;
+  }).join("") || `<div class="empty">${empty}</div>`;
 
   document.getElementById("events").innerHTML = s.events.length ? "<table>" + s.events.slice(0, 30).map(e => {
     const st = e.type === "down" ? "down" : "up";
@@ -184,14 +246,17 @@ function render(s) {
   window.__cellSec = s.cellSec;
 }
 
+function fail(msg) {
+  document.getElementById("banner").innerHTML = `${ico("failing")}<div>${esc(msg)}<small>retrying</small></div>`;
+}
+
 async function refresh() {
   try {
     const r = await fetch("api/status?range=" + range, { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
   } catch (err) {
-    document.getElementById("banner").innerHTML =
-      `${ico("failing")}<div>Cannot reach the monitor<small>${esc(err.message)} · retrying</small></div>`;
+    fail("Cannot reach the monitor: " + err.message);
   }
 }
 
@@ -202,6 +267,31 @@ function setRange(r) {
   refresh();
 }
 document.querySelector(".seg").addEventListener("click", e => { if (e.target.dataset.range) setRange(e.target.dataset.range); });
+
+document.querySelector(".tabs").addEventListener("click", e => {
+  const b = e.target.closest("[data-tab]");
+  if (!b) return;
+  tab = b.dataset.tab;
+  history.replaceState(null, "", tab === "servers" ? "#servers" : location.pathname);
+  if (last) render(last);
+});
+
+document.getElementById("targets").addEventListener("click", async e => {
+  const b = e.target.closest("[data-alert]");
+  if (!b) return;
+  const enabled = b.getAttribute("aria-checked") !== "true";
+  b.setAttribute("aria-checked", enabled);
+  b.disabled = true;
+  try {
+    const r = await fetch("api/alerts", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: b.dataset.alert, enabled }) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    await refresh();
+  } catch (err) {
+    await refresh();
+    fail("Could not change alert setting: " + err.message);
+  }
+});
 
 const tip = document.getElementById("tip");
 function showTip(e) {

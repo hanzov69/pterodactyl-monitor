@@ -8,47 +8,89 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	bucketSecs    = 300                 // history resolution
-	retention     = 30 * 24 * time.Hour // history kept
-	maxEvents     = 100
-	saveEvery     = 5 * time.Minute
-	noticeMaxAge  = 24 * time.Hour
-	userAgent     = "pterodactyl-monitor/1.0"
-	statusUp      = "up"
-	statusFailing = "failing" // failing, but below the alert threshold
-	statusDown    = "down"
-	statusMaint   = "maintenance"
-	statusUnknown = "unknown"
+	bucketSecs     = 300                 // history resolution
+	retention      = 30 * 24 * time.Hour // history kept
+	maxEvents      = 100
+	saveEvery      = 5 * time.Minute
+	noticeMaxAge   = 24 * time.Hour
+	maxConcurrent  = 8
+	userAgent      = "pterodactyl-monitor/1.0"
+	statusUp       = "up"
+	statusFailing  = "failing"  // failing, but below the alert threshold
+	statusStarting = "starting" // server is starting or stopping
+	statusDown     = "down"
+	statusMaint    = "maintenance"
+	statusUnknown  = "unknown"
 )
+
+// Probe is a service-level check run against a server that the panel reports as running.
+type Probe struct {
+	Type string `json:"type"`           // http | tcp | a2s
+	URL  string `json:"url,omitempty"`  // http
+	Host string `json:"host,omitempty"` // tcp, a2s
+	Port int    `json:"port,omitempty"`
+}
+
+func (p *Probe) String() string {
+	switch {
+	case p == nil:
+		return ""
+	case p.Type == "http":
+		return p.URL
+	}
+	return p.Type + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port))
+}
 
 type Target struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
-	Kind        string `json:"kind"` // panel | api | node
+	Kind        string `json:"kind"` // panel | api | node | server
 	URL         string `json:"url"`
 	NodeID      int    `json:"nodeId,omitempty"`
 	Maintenance bool   `json:"maintenance,omitempty"`
+
+	// Servers only.
+	Identifier string `json:"identifier,omitempty"` // panel short id
+	Node       string `json:"node,omitempty"`
+	Idle       string `json:"idle,omitempty"` // suspended, installing, ...: shown, never checked
+	Probe      *Probe `json:"probe,omitempty"`
+}
+
+// Label is the name used in emails and the event log.
+func (t Target) Label() string {
+	if t.Kind == "server" {
+		return "Server: " + t.Name
+	}
+	return t.Name
 }
 
 type State struct {
-	Status    string    `json:"status"`
-	Since     time.Time `json:"since"`
-	FailSince time.Time `json:"failSince"`
-	Fails     int       `json:"fails"`
-	LastCheck time.Time `json:"lastCheck"`
-	LatencyMs int64     `json:"latencyMs"`
-	Detail    string    `json:"detail"`
+	Status       string    `json:"status"`
+	Since        time.Time `json:"since"`
+	FailSince    time.Time `json:"failSince"`
+	PendingSince time.Time `json:"pendingSince"`
+	Fails        int       `json:"fails"`
+	LastCheck    time.Time `json:"lastCheck"`
+	LatencyMs    int64     `json:"latencyMs"`
+	Detail       string    `json:"detail"`
+	Power        string    `json:"power,omitempty"` // servers: running | starting | stopping | offline
+	Stale        bool      `json:"stale,omitempty"` // last check could not determine anything
+	SeenUp       bool      `json:"seenUp,omitempty"`
+	Announced    bool      `json:"announced,omitempty"` // current outage is in the event log
+	Notified     bool      `json:"notified,omitempty"`  // current outage was emailed
 }
 
 type Bucket struct {
@@ -74,17 +116,32 @@ type Notice struct {
 
 type Data struct {
 	Nodes   []Target                     `json:"nodes"`
+	Servers []Target                     `json:"servers"`
 	States  map[string]*State            `json:"states"`
 	History map[string]map[int64]*Bucket `json:"history"`
 	Events  []Event                      `json:"events"`
 	Outbox  []Notice                     `json:"outbox"`
+	Muted   map[string]bool              `json:"muted"` // targets with email alerts switched off
 }
 
+type outcome int
+
+const (
+	resSkip    outcome = iota // nothing could be determined; leave status alone
+	resOK                     // healthy
+	resFail                   // unhealthy
+	resPending                // server starting/stopping: not up, but not yet a failure
+)
+
 type result struct {
-	ok     bool
+	kind   outcome
 	ms     int64
 	detail string
+	power  string
 }
+
+func okResult(ms int64, detail string) result   { return result{kind: resOK, ms: ms, detail: detail} }
+func failResult(ms int64, detail string) result { return result{kind: resFail, ms: ms, detail: detail} }
 
 type Monitor struct {
 	cfg      Config
@@ -93,7 +150,6 @@ type Monitor struct {
 
 	mu        sync.Mutex
 	d         Data
-	tokens    map[int]string // wings daemon tokens, memory only
 	lastCycle time.Time
 	started   time.Time
 }
@@ -109,12 +165,7 @@ func NewMonitor(cfg Config) *Monitor {
 		cfg:      cfg,
 		secure:   mk(false),
 		insecure: mk(true),
-		tokens:   map[int]string{},
 		started:  time.Now(),
-		d: Data{
-			States:  map[string]*State{},
-			History: map[string]map[int64]*Bucket{},
-		},
 	}
 	m.load()
 	return m
@@ -123,6 +174,17 @@ func NewMonitor(cfg Config) *Monitor {
 func (m *Monitor) dataFile() string { return filepath.Join(m.cfg.DataDir, "state.json") }
 
 func (m *Monitor) load() {
+	defer func() {
+		if m.d.States == nil {
+			m.d.States = map[string]*State{}
+		}
+		if m.d.History == nil {
+			m.d.History = map[string]map[int64]*Bucket{}
+		}
+		if m.d.Muted == nil {
+			m.d.Muted = map[string]bool{}
+		}
+	}()
 	b, err := os.ReadFile(m.dataFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return
@@ -136,12 +198,6 @@ func (m *Monitor) load() {
 		os.Rename(m.dataFile(), bad)
 		log.Printf("state file unreadable (%v); moved to %s and starting fresh", err, bad)
 		return
-	}
-	if d.States == nil {
-		d.States = map[string]*State{}
-	}
-	if d.History == nil {
-		d.History = map[string]map[int64]*Bucket{}
 	}
 	m.d = d
 }
@@ -168,7 +224,7 @@ func (m *Monitor) Healthy() bool {
 	if last.IsZero() {
 		last = m.started
 	}
-	return time.Since(last) < 3*m.cfg.Interval+3*m.cfg.Timeout
+	return time.Since(last) < 3*m.cfg.Interval+6*m.cfg.Timeout
 }
 
 func (m *Monitor) Run(ctx context.Context) {
@@ -202,21 +258,29 @@ func (m *Monitor) staticTargets() []Target {
 	if m.cfg.APIKey != "" {
 		ts = append(ts, Target{ID: "panel-api", Name: "Panel API", Kind: "api", URL: m.cfg.APIURL})
 	}
+	if m.cfg.ClientKey != "" {
+		ts = append(ts, Target{ID: "panel-client-api", Name: "Panel API (servers)", Kind: "api", URL: m.cfg.APIURL})
+	}
 	return ts
 }
 
 func (m *Monitor) cycle(ctx context.Context) {
 	results := map[string]result{}
 	var rmu sync.Mutex
+	set := func(id string, r result) {
+		rmu.Lock()
+		results[id] = r
+		rmu.Unlock()
+	}
 	var wg sync.WaitGroup
-	run := func(t Target, fn func() result) {
+	sem := make(chan struct{}, maxConcurrent)
+	run := func(id string, fn func() result) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := fn()
-			rmu.Lock()
-			results[t.ID] = r
-			rmu.Unlock()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			set(id, fn())
 		}()
 	}
 
@@ -224,27 +288,46 @@ func (m *Monitor) cycle(ctx context.Context) {
 	for _, t := range static {
 		switch t.ID {
 		case "panel-public":
-			run(t, func() result { return m.checkPanel(ctx, t.URL, false) })
+			run(t.ID, func() result { return m.checkPanel(ctx, t.URL, false) })
 		case "panel-lan":
-			run(t, func() result { return m.checkPanel(ctx, t.URL, m.cfg.LANInsecure) })
+			run(t.ID, func() result { return m.checkPanel(ctx, t.URL, m.cfg.LANInsecure) })
 		case "panel-api":
 			// Synchronous: a successful listing refreshes the node set checked below.
 			nodes, r := m.listNodes(ctx)
-			results[t.ID] = r
-			if r.ok {
+			set(t.ID, r)
+			if r.kind == resOK {
 				m.mu.Lock()
 				m.d.Nodes = nodes
+				m.mu.Unlock()
+			}
+		case "panel-client-api":
+			servers, r := m.listServers(ctx)
+			set(t.ID, r)
+			if r.kind == resOK {
+				m.mu.Lock()
+				m.d.Servers = servers
 				m.mu.Unlock()
 			}
 		}
 	}
 
+	// If a listing failed, the last known nodes/servers keep being checked.
 	m.mu.Lock()
-	nodes := append([]Target(nil), m.d.Nodes...)
+	if m.cfg.APIKey == "" {
+		m.d.Nodes = nil
+	}
+	if m.cfg.ClientKey == "" {
+		m.d.Servers = nil
+	}
+	dynamic := append(append([]Target(nil), m.d.Nodes...), m.d.Servers...)
 	m.mu.Unlock()
-	for _, n := range nodes {
-		if !n.Maintenance {
-			run(n, func() result { return m.checkNode(ctx, n) })
+	for _, t := range dynamic {
+		switch {
+		case t.Maintenance || t.Idle != "":
+		case t.Kind == "node":
+			run(t.ID, func() result { return m.checkNode(ctx, t) })
+		case t.Kind == "server":
+			run(t.ID, func() result { return m.checkServer(ctx, t) })
 		}
 	}
 	wg.Wait()
@@ -255,15 +338,18 @@ func (m *Monitor) cycle(ctx context.Context) {
 	now := time.Now()
 	m.mu.Lock()
 	active := map[string]bool{}
-	for _, t := range append(static, nodes...) {
+	for _, t := range append(static, dynamic...) {
 		active[t.ID] = true
-		if t.Maintenance {
-			m.setMaintenance(t, now)
-		} else {
+		switch {
+		case t.Maintenance:
+			m.setIdle(t, statusMaint, "maintenance mode enabled in panel", now)
+		case t.Idle != "":
+			m.setIdle(t, t.Idle, "server is "+strings.ReplaceAll(t.Idle, "_", " "), now)
+		default:
 			m.apply(t, results[t.ID], now)
 		}
 	}
-	for id := range m.d.States { // nodes deleted from the panel
+	for id := range m.d.States { // nodes/servers deleted from the panel
 		if !active[id] {
 			delete(m.d.States, id)
 		}
@@ -283,17 +369,38 @@ func (m *Monitor) state(id string, now time.Time) *State {
 	return st
 }
 
-func (m *Monitor) setMaintenance(t Target, now time.Time) {
+// setIdle parks a target that is deliberately out of service (node in
+// maintenance, suspended server): shown on the dashboard, never alerted on.
+func (m *Monitor) setIdle(t Target, status, detail string, now time.Time) {
 	st := m.state(t.ID, now)
-	if st.Status != statusMaint {
-		*st = State{Status: statusMaint, Since: now, Detail: "maintenance mode enabled in panel"}
+	if st.Status != status {
+		*st = State{Status: status, Since: now, Detail: detail}
 	}
 }
 
 // apply records one check result and handles status transitions. Caller holds m.mu.
 func (m *Monitor) apply(t Target, r result, now time.Time) {
 	st := m.state(t.ID, now)
-	st.LastCheck, st.LatencyMs, st.Detail = now, r.ms, r.detail
+	st.LastCheck, st.Detail, st.Power = now, r.detail, r.power
+	st.Stale = r.kind == resSkip
+	if r.kind == resSkip {
+		return
+	}
+	st.LatencyMs = r.ms
+
+	// A server may sit in "starting" for a while; past the grace period that is a failure.
+	if r.kind == resPending {
+		if st.PendingSince.IsZero() {
+			st.PendingSince = now
+		}
+		if d := now.Sub(st.PendingSince); d > m.cfg.StartGrace {
+			r.kind = resFail
+			r.detail = fmt.Sprintf("stuck %s for %s", r.power, strings.TrimSuffix(d.Round(time.Minute).String(), "0s"))
+			st.Detail = r.detail
+		}
+	} else {
+		st.PendingSince = time.Time{}
+	}
 
 	h := m.d.History[t.ID]
 	if h == nil {
@@ -307,15 +414,23 @@ func (m *Monitor) apply(t Target, r result, now time.Time) {
 		h[key] = b
 	}
 	b.Total++
-	if r.ok {
+	if r.kind == resOK {
 		b.Up++
 		b.MsSum += r.ms
 	}
 
-	prev, next := st.Status, statusUp
-	if r.ok {
+	prev := st.Status
+	var next string
+	switch r.kind {
+	case resOK:
 		st.Fails = 0
-	} else {
+		next = statusUp
+	case resPending:
+		next = statusStarting
+		if prev == statusDown {
+			next = statusDown // not recovered until it is actually up
+		}
+	default:
 		st.Fails++
 		if st.Fails == 1 {
 			st.FailSince = now
@@ -325,25 +440,56 @@ func (m *Monitor) apply(t Target, r result, now time.Time) {
 			next = statusDown
 		}
 	}
+	if next == statusUp {
+		defer func() { st.SeenUp = true }()
+	}
 	if next == prev {
 		return
 	}
 	st.Status = next
+
+	// First line of an email's details: the URL, or for servers the service check (if any).
+	where := func(width int) string {
+		switch {
+		case t.URL == "":
+			return ""
+		case t.Kind == "server":
+			return fmt.Sprintf("%-*s %s\n", width, "Check:", t.URL)
+		}
+		return fmt.Sprintf("%-*s %s\n", width, "URL:", t.URL)
+	}
 	switch {
 	case next == statusDown:
 		st.Since = st.FailSince
-		m.event(Event{Time: now, TargetID: t.ID, Name: t.Name, Type: "down", Detail: r.detail})
-		m.notify(now, "DOWN: "+t.Name, fmt.Sprintf(
-			"%s is DOWN\n\nURL:    %s\nSince:  %s\nReason: %s\nFailed checks in a row: %d\n",
-			t.Name, t.URL, fmtTime(st.Since), r.detail, st.Fails))
+		// A server that has never been seen running (e.g. one that is simply
+		// switched off when first discovered) is shown as down but not announced.
+		if t.Kind == "server" && !st.SeenUp {
+			return
+		}
+		st.Announced = true
+		m.event(Event{Time: now, TargetID: t.ID, Name: t.Label(), Type: "down", Detail: r.detail})
+		if !m.d.Muted[t.ID] {
+			st.Notified = true
+			m.notify(now, "DOWN: "+t.Label(), fmt.Sprintf(
+				"%s is DOWN\n\n%sSince:  %s\nReason: %s\nFailed checks in a row: %d\n",
+				t.Label(), where(7), fmtTime(st.Since), r.detail, st.Fails))
+		}
 	case next == statusUp && prev == statusDown:
 		dur := now.Sub(st.Since).Round(time.Second)
-		m.event(Event{Time: now, TargetID: t.ID, Name: t.Name, Type: "up", Detail: r.detail, DurationSec: int64(dur.Seconds())})
-		m.notify(now, "RECOVERED: "+t.Name, fmt.Sprintf(
-			"%s has RECOVERED\n\nURL:       %s\nDown from: %s\nUp again:  %s\nDowntime:  %s\n",
-			t.Name, t.URL, fmtTime(st.Since), fmtTime(now), dur))
+		if t.Kind != "server" { // only servers can have a quiet or muted outage
+			st.Announced, st.Notified = true, true
+		}
+		if st.Announced {
+			m.event(Event{Time: now, TargetID: t.ID, Name: t.Label(), Type: "up", Detail: r.detail, DurationSec: int64(dur.Seconds())})
+		}
+		if st.Notified {
+			m.notify(now, "RECOVERED: "+t.Label(), fmt.Sprintf(
+				"%s has RECOVERED\n\n%sDown from: %s\nUp again:  %s\nDowntime:  %s\n",
+				t.Label(), where(10), fmtTime(st.Since), fmtTime(now), dur))
+		}
+		st.Announced, st.Notified = false, false
 		st.Since = now
-	case next == statusUp && prev != statusFailing:
+	case next == statusUp && prev != statusFailing, next == statusStarting:
 		st.Since = now
 	}
 }
@@ -362,6 +508,28 @@ func (m *Monitor) notify(now time.Time, subject, body string) {
 	if m.cfg.SMTP.Enabled() {
 		m.d.Outbox = append(m.d.Outbox, Notice{Time: now, Subject: subject, Body: body})
 	}
+}
+
+// SetAlerts switches email alerts for one server on or off.
+func (m *Monitor) SetAlerts(id string, enabled bool) bool {
+	m.mu.Lock()
+	known := false
+	for _, t := range m.d.Servers {
+		known = known || t.ID == id
+	}
+	if known {
+		if enabled {
+			delete(m.d.Muted, id)
+		} else {
+			m.d.Muted[id] = true
+		}
+	}
+	m.mu.Unlock()
+	if known {
+		log.Printf("alerts for %s set to %v", id, enabled)
+		m.Save()
+	}
+	return known
 }
 
 // flushOutbox sends all pending notices as one email. On failure they stay
@@ -421,7 +589,7 @@ func (m *Monitor) prune() {
 	}
 }
 
-// ---- checks ----
+// ---- panel and node checks ----
 
 func (m *Monitor) get(ctx context.Context, skipVerify bool, rawURL string, hdr map[string]string) (int, []byte, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -442,7 +610,7 @@ func (m *Monitor) get(ctx context.Context, skipVerify bool, rawURL string, hdr m
 		return 0, nil, time.Since(start).Milliseconds(), err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	return resp.StatusCode, body, time.Since(start).Milliseconds(), nil
 }
 
@@ -454,19 +622,26 @@ func errDetail(err error) string {
 		}
 		err = ue.Err
 	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "timed out"
+	}
 	return err.Error()
 }
 
 func (m *Monitor) checkPanel(ctx context.Context, u string, skipVerify bool) result {
 	code, _, ms, err := m.get(ctx, skipVerify, u, nil)
 	if err != nil {
-		return result{false, ms, errDetail(err)}
+		return failResult(ms, errDetail(err))
 	}
-	return result{code < 400, ms, fmt.Sprintf("HTTP %d", code)}
+	if code >= 400 {
+		return failResult(ms, fmt.Sprintf("HTTP %d", code))
+	}
+	return okResult(ms, fmt.Sprintf("HTTP %d", code))
 }
 
-func (m *Monitor) apiHeaders() map[string]string {
-	return map[string]string{"Authorization": "Bearer " + m.cfg.APIKey, "Accept": "application/json"}
+func bearer(key string) map[string]string {
+	return map[string]string{"Authorization": "Bearer " + key, "Accept": "application/json"}
 }
 
 func (m *Monitor) listNodes(ctx context.Context) ([]Target, result) {
@@ -474,17 +649,17 @@ func (m *Monitor) listNodes(ctx context.Context) ([]Target, result) {
 	var totalMs int64
 	for page := 1; ; page++ {
 		u := fmt.Sprintf("%s/api/application/nodes?per_page=100&page=%d", m.cfg.APIURL, page)
-		code, body, ms, err := m.get(ctx, m.cfg.LANInsecure, u, m.apiHeaders())
+		code, body, ms, err := m.get(ctx, m.cfg.LANInsecure, u, bearer(m.cfg.APIKey))
 		totalMs += ms
 		if err != nil {
-			return nil, result{false, totalMs, errDetail(err)}
+			return nil, failResult(totalMs, errDetail(err))
 		}
 		if code != http.StatusOK {
 			hint := ""
 			if code == 401 || code == 403 {
 				hint = " (check PANEL_API_KEY: needs an Application API key with Nodes: Read)"
 			}
-			return nil, result{false, totalMs, fmt.Sprintf("HTTP %d%s", code, hint)}
+			return nil, failResult(totalMs, fmt.Sprintf("HTTP %d%s", code, hint))
 		}
 		var resp struct {
 			Data []struct {
@@ -497,14 +672,10 @@ func (m *Monitor) listNodes(ctx context.Context) ([]Target, result) {
 					Maintenance bool   `json:"maintenance_mode"`
 				} `json:"attributes"`
 			} `json:"data"`
-			Meta struct {
-				Pagination struct {
-					TotalPages int `json:"total_pages"`
-				} `json:"pagination"`
-			} `json:"meta"`
+			Meta pageMeta `json:"meta"`
 		}
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, result{false, totalMs, "unexpected API response: " + err.Error()}
+			return nil, failResult(totalMs, "unexpected API response: "+err.Error())
 		}
 		for _, d := range resp.Data {
 			a := d.Attributes
@@ -522,62 +693,26 @@ func (m *Monitor) listNodes(ctx context.Context) ([]Target, result) {
 		}
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
-	return nodes, result{true, totalMs, fmt.Sprintf("%d node(s) listed", len(nodes))}
+	return nodes, okResult(totalMs, fmt.Sprintf("%d node(s) listed", len(nodes)))
 }
 
-// nodeToken returns the Wings daemon token for a node (cached), or "" if the
-// API key isn't allowed to read it. Without a token we can still tell that
-// Wings is alive, just not query its version.
-func (m *Monitor) nodeToken(ctx context.Context, nodeID int) string {
-	m.mu.Lock()
-	tok, ok := m.tokens[nodeID]
-	m.mu.Unlock()
-	if ok {
-		return tok
-	}
-	u := fmt.Sprintf("%s/api/application/nodes/%d/configuration", m.cfg.APIURL, nodeID)
-	code, body, _, err := m.get(ctx, m.cfg.LANInsecure, u, m.apiHeaders())
-	if err != nil || code != http.StatusOK {
-		return ""
-	}
-	var c struct {
-		Token string `json:"token"`
-	}
-	json.Unmarshal(body, &c)
-	m.mu.Lock()
-	m.tokens[nodeID] = c.Token
-	m.mu.Unlock()
-	return c.Token
+type pageMeta struct {
+	Pagination struct {
+		TotalPages int `json:"total_pages"`
+	} `json:"pagination"`
 }
 
+// checkNode asks the node's Wings daemon for anything at all. Wings answers
+// 401 to requests without its daemon token, which is enough to know it is alive.
 func (m *Monitor) checkNode(ctx context.Context, n Target) result {
-	hdr := map[string]string{"Accept": "application/json"}
-	tok := m.nodeToken(ctx, n.NodeID)
-	if tok != "" {
-		hdr["Authorization"] = "Bearer " + tok
-	}
-	code, body, ms, err := m.get(ctx, m.cfg.NodeInsecure, n.URL+"/api/system", hdr)
-	if err != nil {
-		return result{false, ms, errDetail(err)}
-	}
+	code, _, ms, err := m.get(ctx, m.cfg.NodeInsecure, n.URL+"/api/system", map[string]string{"Accept": "application/json"})
 	switch {
-	case code == http.StatusOK:
-		var sys struct {
-			Version string `json:"version"`
-		}
-		if json.Unmarshal(body, &sys) == nil && sys.Version != "" {
-			return result{true, ms, "Wings " + sys.Version}
-		}
-		return result{true, ms, "Wings responding"}
-	case code == 401 || code == 403:
-		if tok != "" { // token rotated; refetch next cycle
-			m.mu.Lock()
-			delete(m.tokens, n.NodeID)
-			m.mu.Unlock()
-		}
-		return result{true, ms, "Wings responding"}
+	case err != nil:
+		return failResult(ms, errDetail(err))
+	case code == 200 || code == 401 || code == 403:
+		return okResult(ms, "Wings responding")
 	default:
-		return result{false, ms, fmt.Sprintf("HTTP %d from Wings", code)}
+		return failResult(ms, fmt.Sprintf("HTTP %d from Wings", code))
 	}
 }
 
@@ -593,6 +728,7 @@ type Cell struct {
 type TargetView struct {
 	Target
 	State
+	Alerts bool                `json:"alerts"`
 	Uptime map[string]*float64 `json:"uptime"`
 	Cells  []Cell              `json:"cells"`
 }
@@ -606,6 +742,7 @@ type Snapshot struct {
 	Targets     []TargetView `json:"targets"`
 	Events      []Event      `json:"events"`
 	EmailOn     bool         `json:"emailEnabled"`
+	ServersOn   bool         `json:"serversEnabled"`
 }
 
 var ranges = map[string]struct {
@@ -628,7 +765,7 @@ func (m *Monitor) Snapshot(rng string) Snapshot {
 
 	s := Snapshot{
 		Generated: now, LastCycle: m.lastCycle, IntervalSec: int(m.cfg.Interval.Seconds()),
-		Range: rng, CellSec: r.cellSec, EmailOn: m.cfg.SMTP.Enabled(),
+		Range: rng, CellSec: r.cellSec, EmailOn: m.cfg.SMTP.Enabled(), ServersOn: m.cfg.ClientKey != "",
 		Targets: []TargetView{}, Events: []Event{},
 	}
 	for i := len(m.d.Events) - 1; i >= 0; i-- {
@@ -639,12 +776,12 @@ func (m *Monitor) Snapshot(rng string) Snapshot {
 	end := (now.Unix()/r.cellSec + 1) * r.cellSec
 	start := end - nCells*r.cellSec
 
-	for _, t := range append(m.staticTargets(), m.d.Nodes...) {
+	for _, t := range append(append(m.staticTargets(), m.d.Nodes...), m.d.Servers...) {
 		st := m.d.States[t.ID]
 		if st == nil {
 			st = &State{Status: statusUnknown, Since: now}
 		}
-		v := TargetView{Target: t, State: *st, Uptime: map[string]*float64{}, Cells: make([]Cell, nCells)}
+		v := TargetView{Target: t, State: *st, Alerts: !m.d.Muted[t.ID], Uptime: map[string]*float64{}, Cells: make([]Cell, nCells)}
 		for i := range v.Cells {
 			v.Cells[i].T = start + int64(i)*r.cellSec
 		}
