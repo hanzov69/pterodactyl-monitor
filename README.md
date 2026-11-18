@@ -86,7 +86,7 @@ else are rejected. Don't put it behind an internet-facing Ingress.
 | Variable | Default | |
 |---|---|---|
 | `PANEL_CLIENT_KEY` | – | Account API key (`ptlc_`). Setting it turns server monitoring on |
-| `SERVER_CHECKS` | – | Per-server service checks (JSON, see below) |
+| `SERVER_CHECKS` | – | Per-server service checks (JSON, see [Setting checks yourself](#setting-checks-yourself)) |
 | `START_GRACE` | `15m` | How long a server may be starting/stopping before it counts as failing |
 
 Everything in this section is off unless `PANEL_CLIENT_KEY` is set. Without
@@ -113,24 +113,75 @@ the panel. A running server can also get a service check:
 | `tcp` | Connects to a port | - |
 | `none` | Power state only | Everything else |
 
-Detection goes by the server's egg, image and startup command, and uses the
-ports the egg defines (for example Rust's and Enshrouded's `QUERY_PORT`,
-Valheim's game port + 1, Palworld's `RCON_PORT`). Valheim servers with
-crossplay enabled are reached through PlayFab and answer nothing locally, so
-they stay on power state only. The Enshrouded and Project Zomboid rules follow
-those games' documented query ports but have not been exercised against live
-servers.
+### Automatic checks
 
-Override or add checks per server with `SERVER_CHECKS`, a JSON object keyed by
-server name, short id or UUID:
+There is nothing to configure for the server types in the last column: once
+`PANEL_CLIENT_KEY` is set, each server is matched by its egg name, Docker
+image and startup command, and the check uses the ports the egg already
+defines.
+
+| Server type | Check | Where it connects | What has to be true |
+|---|---|---|---|
+| Rust | `a2s` | The egg's `QUERY_PORT` variable (else the primary port), UDP | - |
+| Valheim | `a2s` | Primary port + 1, UDP | Crossplay off. Crossplay servers go through PlayFab and answer nothing locally, so they get no check |
+| Enshrouded | `a2s` | The egg's `QUERY_PORT` variable (else primary port + 1), UDP | - |
+| Project Zomboid | `a2s` | Primary port, UDP | - |
+| Source engine (`srcds`) | `a2s` | Primary port, UDP | - |
+| Palworld | `palworld` | The egg's `RCON_PORT` variable, TCP | RCON enabled on the server, and the egg's `ADMIN_PASSWORD` variable matching it |
+| Minecraft Java | `minecraft` | Primary port, TCP | `enable-status` not turned off in `server.properties` |
+| Don't Starve Together | `raknet` | Primary port, UDP | - |
+| nginx / Apache / Caddy | `http` | `http://<primary allocation>/` | - |
+
+Two things apply to all of them:
+
+- **The monitor must be able to reach the port.** Checks go to the
+  allocation's IP address; if that is `0.0.0.0` or loopback, to its alias, and
+  failing that to the node's FQDN. The port has to be one of the server's
+  allocations (Wings only exposes allocated ports), and open to wherever the
+  monitor runs - UDP for `a2s` and `raknet`.
+- **The egg variables must be visible to the key's account.** The ports and
+  the Palworld password are read from the server's startup variables through
+  the client API, which only returns variables marked as viewable by users.
+
+The Palworld check logs in to RCON and runs the read-only `ShowPlayers` and
+`Info` commands. The password is read from the panel on every cycle and kept
+in memory only: it is never written to the state file, the dashboard or the
+logs, and it cannot be supplied through `SERVER_CHECKS`. If the password
+variable isn't available the check falls back to testing that the RCON port
+is open.
+
+The Enshrouded and Project Zomboid rules follow those games' documented query
+ports but have not been exercised against live servers.
+
+### Setting checks yourself
+
+Use `SERVER_CHECKS` when a server isn't recognised, is recognised wrongly, or
+listens somewhere unusual. It is a JSON object (on one line) keyed by server
+name (case-insensitive), short id or UUID; an entry replaces whatever would
+have been detected for that server.
+
+| Field | Used by | Default |
+|---|---|---|
+| `type` | all | required: `a2s`, `minecraft`, `palworld`, `raknet`, `http`, `tcp` or `none` |
+| `url` | `http` | `http://<host>:<port>/` |
+| `host` | everything except `http` with a `url` | The primary allocation's address (see above) |
+| `port` | everything except `http` with a `url` | The primary allocation's port; for `palworld`, the egg's `RCON_PORT` |
 
 ```
-SERVER_CHECKS={"My Website":{"type":"http","url":"https://www.example.com"},"1a2b3c4d":{"type":"tcp","port":25565},"Some Bot":{"type":"none"}}
+# A Steam-query game that isn't detected, with its query port on a second allocation
+SERVER_CHECKS={"My ARK Server":{"type":"a2s","port":27015}}
+
+# Several at once: a site checked at its public URL, a Palworld server whose egg
+# isn't recognised, a Valheim on a non-standard query port, and a bot with no check
+SERVER_CHECKS={"My Website":{"type":"http","url":"https://www.example.com"},"1a2b3c4d":{"type":"palworld"},"Valheim":{"type":"a2s","port":2500},"Some Bot":{"type":"none"}}
 ```
 
-`host` and `port` default to the server's primary allocation.
+The dashboard shows which check each server ended up with (for example
+`a2s://10.0.0.5:28016`) and, when it fails, why (`running, but no answer to
+server query: timed out`), which is the quickest way to see whether a port or
+host needs overriding.
 
-How a server's status is decided:
+### How a server's status is decided
 
 - **offline**, or running with a failing service check, counts as a failed check.
 - **starting / stopping** is not a failure until it has lasted longer than
