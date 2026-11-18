@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: pterodactyl-monitor
+resources:
+  - ../base
+
+# Settings come from two env files next to this one. Changing either and
+# re-applying rolls the Deployment automatically (generated names are hashed).
+configMapGenerator:
+  - name: pterodactyl-monitor
+    envs: [config.env]
+secretGenerator:
+  - name: pterodactyl-monitor
+    envs: [secret.env]
+
+# Use your own build instead of the published image:
+# images:
+#   - name: ghcr.io/hanzov69/pterodactyl-monitor
+#     newName: registry.example.com/you/pterodactyl-monitor
+#     newTag: latest
+
+patches:
+  # Expose the dashboard on the LAN only: a LoadBalancer address (MetalLB,
+  # kube-vip, ServiceLB...) restricted to your LAN's CIDR. externalTrafficPolicy
+  # Local preserves client source IPs so the range is actually enforced.
+  - target: { kind: Service, name: pterodactyl-monitor }
+    patch: |
+      - { op: replace, path: /spec/type, value: LoadBalancer }
+      - { op: add, path: /spec/externalTrafficPolicy, value: Local }
+      - { op: add, path: /spec/loadBalancerSourceRanges, value: ["192.168.1.0/24"] }
+
+  # Optional: pick a StorageClass other than the cluster default.
+  # - target: { kind: PersistentVolumeClaim, name: pterodactyl-monitor-data }
+  #   patch: |
+  #     - { op: add, path: /spec/storageClassName, value: my-storage-class }
+
+  # Optional: pull secret for a private image.
+  # - target: { kind: Deployment, name: pterodactyl-monitor }
+  #   patch: |
+  #     - { op: add, path: /spec/template/spec/imagePullSecrets, value: [{ name: my-pull-secret }] }

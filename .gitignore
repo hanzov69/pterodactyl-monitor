@@ -1,0 +1,7 @@
+# Your real deployment config lives here (copy of k8s/example); never committed.
+/k8s/local/
+/pterodactyl-monitor
+/data/
+.env
+*.env.local
+.DS_Store

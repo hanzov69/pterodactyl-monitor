@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pterodactyl-monitor-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # Uses the cluster's default StorageClass; patch storageClassName in your overlay to change it.
+  resources:
+    requests:
+      storage: 100Mi

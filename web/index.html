@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pterodactyl Status</title>
+<style>
+  :root {
+    --page: #f4f3ef; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --hairline: #e1e0d9; --border: rgba(11,11,11,.10); --empty: #e1e0d9;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #111110; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+      --hairline: #2c2c2a; --border: rgba(255,255,255,.10); --empty: #2c2c2a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 28px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  h2 { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--muted); margin: 28px 0 8px; }
+  .meta { color: var(--muted); font-size: 12px; }
+
+  .banner { display: flex; align-items: center; gap: 12px; margin: 18px 0 0; padding: 14px 16px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    font-size: 16px; font-weight: 600; }
+  .banner small { display: block; font-size: 12px; font-weight: 400; color: var(--ink-2); }
+
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
+  .toolbar h2 { margin: 0; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+  .seg button { all: unset; cursor: pointer; padding: 5px 12px; font-size: 12px; color: var(--ink-2); }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+  .seg button:focus-visible { outline: 2px solid var(--ink-2); outline-offset: -2px; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; }
+  .target { padding: 14px 16px; }
+  .target + .target { border-top: 1px solid var(--hairline); }
+  .row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+  .name { font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .right { text-align: right; white-space: nowrap; }
+  .pct { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); margin-left: 8px; font-weight: 400; }
+  .ico { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%;
+    font-size: 10px; font-weight: 700; line-height: 1; color: #fff; flex: none; }
+  .banner .ico { width: 26px; height: 26px; font-size: 15px; }
+  .ico.up { background: var(--good); }
+  .ico.failing { background: var(--warning); color: #0b0b0b; }
+  .ico.down { background: var(--critical); }
+  .ico.maintenance, .ico.unknown { background: var(--muted); }
+
+  .strip { display: flex; gap: 2px; height: 28px; margin-top: 10px; }
+  .cell { flex: 1 1 0; min-width: 1px; border-radius: 2px; background: var(--empty); }
+  .cell.good { background: var(--good); }
+  .cell.warning { background: var(--warning); }
+  .cell.serious { background: var(--serious); }
+  .cell.critical { background: var(--critical); }
+  .cell:hover { outline: 2px solid var(--ink); outline-offset: 1px; }
+  .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: 4px; }
+  @media (max-width: 560px) { .strip { gap: 1px; } .cell { border-radius: 1px; } }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; background: var(--empty); }
+
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 9px 16px; border-top: 1px solid var(--hairline); vertical-align: top; }
+  tr:first-child td { border-top: 0; }
+  td.when { width: 1%; white-space: nowrap; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .empty { padding: 16px; color: var(--muted); }
+
+  #tip { position: fixed; z-index: 10; pointer-events: none; display: none; min-width: 150px;
+    background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); }
+  #tip b { display: block; margin-bottom: 2px; }
+  #tip div { color: var(--ink-2); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Pterodactyl Status</h1>
+    <span class="meta" id="updated">Loading…</span>
+  </header>
+  <div class="banner" id="banner"><span class="ico unknown">?</span><div>Loading…</div></div>
+
+  <div class="toolbar">
+    <h2>Uptime</h2>
+    <div class="seg" role="group" aria-label="Time range">
+      <button data-range="24h">24 hours</button><button data-range="7d">7 days</button><button data-range="30d">30 days</button>
+    </div>
+  </div>
+  <div class="card" id="targets"><div class="empty">Loading…</div></div>
+  <div class="legend">
+    <span><i style="background:var(--good)"></i>All checks passed</span>
+    <span><i style="background:var(--warning)"></i>Some failed (≥ 90% up)</span>
+    <span><i style="background:var(--serious)"></i>Mostly failed (&lt; 90% up)</span>
+    <span><i style="background:var(--critical)"></i>All failed</span>
+    <span><i></i>No data</span>
+  </div>
+
+  <h2>Recent events</h2>
+  <div class="card" id="events"><div class="empty">Loading…</div></div>
+</main>
+<div id="tip"></div>
+
+<script>
+const ICON = { up: "✓", failing: "!", down: "✕", maintenance: "–", unknown: "?" };
+const LABEL = { up: "Up", failing: "Failing", down: "Down", maintenance: "Maintenance", unknown: "Pending" };
+let range = "24h";
+try { range = localStorage.getItem("range") || range; } catch {}
+let cells = {}; // "targetIdx:cellIdx" -> tooltip data
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ico = s => `<span class="ico ${s}" aria-hidden="true">${ICON[s] || "?"}</span>`;
+const pct = v => v == null ? "–" : (v >= 99.995 ? "100" : v.toFixed(v >= 99 ? 2 : 1)) + "%";
+const dtf = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const tf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+function dur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m`;
+  return `${sec}s`;
+}
+
+function cellClass(c) {
+  if (!c.total) return "";
+  if (c.up === c.total) return "good";
+  if (c.up === 0) return "critical";
+  return c.up / c.total >= 0.9 ? "warning" : "serious";
+}
+
+function render(s) {
+  const now = new Date(s.generated).getTime();
+  const down = s.targets.filter(t => t.status === "down");
+  const failing = s.targets.filter(t => t.status === "failing");
+  const stale = s.lastCycle.startsWith("0001") ? false : now - new Date(s.lastCycle).getTime() > s.intervalSec * 3000 + 30000;
+
+  let bs = "up", title = "All systems operational", sub = `${s.targets.length} checks, every ${dur(s.intervalSec)}`;
+  if (!s.targets.some(t => t.lastCheck && !t.lastCheck.startsWith("0001"))) { bs = "unknown"; title = "Waiting for first check"; }
+  if (failing.length) { bs = "failing"; title = "Checks failing"; sub = failing.map(t => t.name).join(", "); }
+  if (down.length) { bs = "down"; title = `${down.length} of ${s.targets.length} down`; sub = down.map(t => t.name).join(", "); }
+  if (stale) { bs = "failing"; title = "Monitor data is stale"; sub = "The check loop has not completed recently"; }
+  if (!s.emailEnabled) sub += " · email notifications are not configured";
+  document.getElementById("banner").innerHTML = `${ico(bs)}<div>${esc(title)}<small>${esc(sub)}</small></div>`;
+  document.getElementById("updated").textContent = "Updated " + tf.format(new Date(s.generated));
+  document.title = (down.length ? `(${down.length} down) ` : "") + "Pterodactyl Status";
+
+  cells = {};
+  const first = s.targets[0]?.cells[0];
+  document.getElementById("targets").innerHTML = s.targets.map((t, ti) => {
+    const since = t.status === "unknown" ? "" : ` for ${dur((now - new Date(t.since).getTime()) / 1000)}`;
+    const info = [t.url, t.detail, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
+    const strip = t.cells.map((c, ci) => { cells[`${ti}:${ci}`] = c; return `<div class="cell ${cellClass(c)}" data-c="${ti}:${ci}"></div>`; }).join("");
+    return `<div class="target">
+      <div class="row">
+        <div><span class="name">${esc(t.name)}</span><span class="badge">${ico(t.status)}${LABEL[t.status] || esc(t.status)}${since}</span>
+          <div class="sub">${info}</div></div>
+        <div class="right"><div class="pct">${pct(t.uptime[s.range])}</div><div class="sub">uptime</div></div>
+      </div>
+      <div class="strip" role="img" aria-label="${esc(t.name)} uptime over the last ${s.range}: ${pct(t.uptime[s.range])}">${strip}</div>
+      <div class="axis"><span>${first ? dtf.format(new Date(first.t * 1000)) : ""}</span><span>now</span></div>
+    </div>`;
+  }).join("") || `<div class="empty">No targets configured.</div>`;
+
+  document.getElementById("events").innerHTML = s.events.length ? "<table>" + s.events.slice(0, 30).map(e => {
+    const st = e.type === "down" ? "down" : "up";
+    const what = e.type === "down" ? "went down" : `recovered after ${dur(e.durationSec || 0)}`;
+    return `<tr><td class="when">${dtf.format(new Date(e.time))}</td>
+      <td>${ico(st)} <b>${esc(e.name)}</b> ${what}<div class="sub">${esc(e.detail)}</div></td></tr>`;
+  }).join("") + "</table>" : `<div class="empty">No outages recorded.</div>`;
+
+  window.__cellSec = s.cellSec;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("api/status?range=" + range, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (err) {
+    document.getElementById("banner").innerHTML =
+      `${ico("failing")}<div>Cannot reach the monitor<small>${esc(err.message)} · retrying</small></div>`;
+  }
+}
+
+function setRange(r) {
+  range = r;
+  try { localStorage.setItem("range", r); } catch {}
+  document.querySelectorAll(".seg button").forEach(b => b.setAttribute("aria-pressed", b.dataset.range === r));
+  refresh();
+}
+document.querySelector(".seg").addEventListener("click", e => { if (e.target.dataset.range) setRange(e.target.dataset.range); });
+
+const tip = document.getElementById("tip");
+function showTip(e) {
+  const c = cells[e.target.dataset?.c];
+  if (!c) { tip.style.display = "none"; return; }
+  const from = new Date(c.t * 1000), to = new Date((c.t + window.__cellSec) * 1000);
+  tip.innerHTML = `<b>${dtf.format(from)} – ${dtf.format(to)}</b>` + (c.total
+    ? `<div>${pct(100 * c.up / c.total)} up · ${c.up}/${c.total} checks passed</div>` + (c.ms != null ? `<div>Avg response ${c.ms} ms</div>` : "")
+    : `<div>No data</div>`);
+  tip.style.display = "block";
+  const r = e.target.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + "px";
+  tip.style.top = (r.top - h - 8 < 8 ? r.bottom + 8 : r.top - h - 8) + "px";
+}
+document.addEventListener("mouseover", showTip);
+document.addEventListener("click", showTip);
+
+setRange(["24h", "7d", "30d"].includes(range) ? range : "24h");
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
