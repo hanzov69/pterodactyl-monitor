@@ -105,10 +105,10 @@ the panel. A running server can also get a service check:
 
 | Check | What it does | Chosen automatically for |
 |---|---|---|
-| `a2s` | Steam server query (what the in-game server browser sends); reports players and map | Rust, Valheim, Enshrouded, Project Zomboid, Source-engine servers |
+| `a2s` | Steam server query (what the in-game server browser sends); reports players and map | Rust, Valheim, Enshrouded, Project Zomboid (Steam mode), Source-engine servers |
 | `minecraft` | Java Edition status ping; reports players and version | Minecraft Java servers and proxies |
 | `palworld` | Logs in to RCON with the admin password set in the panel; reports players and version | Palworld |
-| `raknet` | RakNet ping on the game port | Don't Starve Together |
+| `raknet` | RakNet ping on the game port | Don't Starve Together, Project Zomboid started with `-nosteam` |
 | `http` | `GET` a URL, up when status < 400 | nginx / Apache / Caddy style web servers, on the primary allocation |
 | `tcp` | Connects to a port | - |
 | `none` | Power state only | Everything else |
@@ -125,7 +125,7 @@ defines.
 | Rust | `a2s` | The egg's `QUERY_PORT` variable (else the primary port), UDP | - |
 | Valheim | `a2s` | Primary port + 1, UDP | Crossplay off (the egg's `ENABLE_CROSSPLAY` variable). Crossplay servers go through PlayFab and answer nothing locally, so they are judged on power state. The setting is shown next to the server as `crossplay on` / `crossplay off` |
 | Enshrouded | `a2s` | The egg's `QUERY_PORT` variable (else primary port + 1), UDP | - |
-| Project Zomboid | `a2s` | Primary port, UDP | - |
+| Project Zomboid | `a2s`, or `raknet` when started with `-nosteam` | Primary port, UDP | A non-Steam server answers no Steam queries, so it gets the ping instead |
 | Source engine (`srcds`) | `a2s` | Primary port, UDP | - |
 | Palworld | `palworld` | The egg's `RCON_PORT` variable, TCP | RCON enabled on the server, and the egg's `ADMIN_PASSWORD` variable matching it |
 | Minecraft Java | `minecraft` | Primary port, TCP | `enable-status` not turned off in `server.properties` |
@@ -150,8 +150,9 @@ logs, and it cannot be supplied through `SERVER_CHECKS`. If the password
 variable isn't available the check falls back to testing that the RCON port
 is open.
 
-The Enshrouded and Project Zomboid rules follow those games' documented query
-ports but have not been exercised against live servers.
+Two rules follow documented query ports but have not been exercised against
+live servers: Project Zomboid in Steam mode, and Source-engine servers. The
+others have.
 
 ### Setting checks yourself
 

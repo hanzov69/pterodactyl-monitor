@@ -271,7 +271,11 @@ func (m *Monitor) describe(s clientServer) (probe *Probe, tags []string, note st
 			probe = build("a2s", "", "", port+1)
 		}
 	case has("projectzomboid", "project zomboid"):
-		probe = build("a2s", "", "", 0)
+		if has("-nosteam") { // Steam disabled: no Steam query, but the game port still answers pings
+			probe = build("raknet", "", "", 0)
+		} else {
+			probe = build("a2s", "", "", 0)
+		}
 	case has("palserver", "palworld"): // nothing unauthenticated to ask; use its RCON port
 		if p := portVar("RCON_PORT"); p != 0 {
 			probe = build("palworld", "", "", p)
