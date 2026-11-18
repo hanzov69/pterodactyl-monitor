@@ -126,7 +126,7 @@ type Event struct {
 	Time        time.Time `json:"time"`
 	TargetID    string    `json:"targetId"`
 	Name        string    `json:"name"`
-	Type        string    `json:"type"` // down | up
+	Type        string    `json:"type"` // down | up | notice
 	Detail      string    `json:"detail"`
 	DurationSec int64     `json:"durationSec,omitempty"`
 }

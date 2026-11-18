@@ -1,5 +1,7 @@
 # Your real deployment config lives here (copy of k8s/example); never committed.
 /k8s/local/
+# Private notes for AI agents; contains deployment details.
+/AGENTS.md
 /pterodactyl-monitor
 /data/
 .env
