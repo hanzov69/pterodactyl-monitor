@@ -38,20 +38,30 @@ const (
 
 // Probe is a service-level check run against a server that the panel reports as running.
 type Probe struct {
-	Type string `json:"type"`           // http | tcp | a2s
+	Type string `json:"type"`           // http | tcp | a2s | minecraft | raknet | palworld
 	URL  string `json:"url,omitempty"`  // http
-	Host string `json:"host,omitempty"` // tcp, a2s
+	Host string `json:"host,omitempty"` // everything else
 	Port int    `json:"port,omitempty"`
+
+	// Password is the RCON password for a palworld check, read from the
+	// panel each cycle. It is deliberately never written to disk or to the
+	// dashboard API.
+	Password string `json:"-"`
 }
 
 func (p *Probe) String() string {
+	scheme := ""
 	switch {
 	case p == nil:
 		return ""
 	case p.Type == "http":
 		return p.URL
+	case p.Type == "palworld":
+		scheme = "rcon"
+	default:
+		scheme = p.Type
 	}
-	return p.Type + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port))
+	return scheme + "://" + net.JoinHostPort(p.Host, strconv.Itoa(p.Port))
 }
 
 type Target struct {

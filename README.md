@@ -105,10 +105,21 @@ the panel. A running server can also get a service check:
 
 | Check | What it does | Chosen automatically for |
 |---|---|---|
-| `a2s` | Steam server query (what the in-game server browser sends); reports players and map | Rust (on its query port), Source-engine servers |
+| `a2s` | Steam server query (what the in-game server browser sends); reports players and map | Rust, Valheim, Enshrouded, Project Zomboid, Source-engine servers |
+| `minecraft` | Java Edition status ping; reports players and version | Minecraft Java servers and proxies |
+| `palworld` | Logs in to RCON with the admin password set in the panel; reports players and version | Palworld |
+| `raknet` | RakNet ping on the game port | Don't Starve Together |
 | `http` | `GET` a URL, up when status < 400 | nginx / Apache / Caddy style web servers, on the primary allocation |
 | `tcp` | Connects to a port | - |
 | `none` | Power state only | Everything else |
+
+Detection goes by the server's egg, image and startup command, and uses the
+ports the egg defines (for example Rust's and Enshrouded's `QUERY_PORT`,
+Valheim's game port + 1, Palworld's `RCON_PORT`). Valheim servers with
+crossplay enabled are reached through PlayFab and answer nothing locally, so
+they stay on power state only. The Enshrouded and Project Zomboid rules follow
+those games' documented query ports but have not been exercised against live
+servers.
 
 Override or add checks per server with `SERVER_CHECKS`, a JSON object keyed by
 server name, short id or UUID:
@@ -127,7 +138,9 @@ How a server's status is decided:
   booting does.
 - A server that is already off when the monitor first sees it is shown as
   offline without being reported; it is only treated as an outage once it has
-  been seen running.
+  been seen up. The same applies to a service check that has never passed, so
+  a wrongly detected check shows as down but never emails you (set it to
+  `none` or the right type in `SERVER_CHECKS`).
 - Suspended and installing servers are shown but never alerted on.
 - If the panel can't report a server's state (node unreachable), the service
   check decides on its own; without one the server is shown as unknown.

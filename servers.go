@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // clientServer is a server as returned by the panel's client API.
@@ -136,7 +135,7 @@ func (m *Monitor) listServers(ctx context.Context) ([]Target, result) {
 
 // ProbeSpec is a per-server override from SERVER_CHECKS.
 type ProbeSpec struct {
-	Type string `json:"type"` // http | tcp | a2s | none
+	Type string `json:"type"` // http | tcp | a2s | minecraft | raknet | palworld | none
 	URL  string `json:"url"`
 	Host string `json:"host"`
 	Port int    `json:"port"`
@@ -154,9 +153,9 @@ func parseServerChecks(raw string) (map[string]ProbeSpec, error) {
 	for k, v := range in {
 		v.Type = strings.ToLower(v.Type)
 		switch v.Type {
-		case "http", "tcp", "a2s", "none":
+		case "http", "tcp", "a2s", "minecraft", "raknet", "palworld", "none":
 		default:
-			return nil, fmt.Errorf("%q: unknown check type %q (want http, tcp, a2s or none)", k, v.Type)
+			return nil, fmt.Errorf("%q: unknown check type %q (want http, tcp, a2s, minecraft, raknet, palworld or none)", k, v.Type)
 		}
 		if v.URL != "" {
 			if u, err := url.Parse(v.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -193,6 +192,14 @@ func (s clientServer) endpoint() (string, int) {
 // their power state alone.
 func (m *Monitor) probeFor(s clientServer) *Probe {
 	host, port := s.endpoint()
+	vars := map[string]string{}
+	for _, v := range s.Relationships.Variables.Data {
+		vars[v.Attributes.Env] = v.Attributes.Value
+	}
+	portVar := func(name string) int {
+		n, _ := strconv.Atoi(vars[name])
+		return n
+	}
 	build := func(typ, rawURL, h string, p int) *Probe {
 		if h == "" {
 			h = host
@@ -207,6 +214,8 @@ func (m *Monitor) probeFor(s clientServer) *Probe {
 			return nil
 		case typ == "http":
 			return &Probe{Type: "http", URL: "http://" + net.JoinHostPort(h, strconv.Itoa(p)) + "/"}
+		case typ == "palworld":
+			return &Probe{Type: typ, Host: h, Port: p, Password: vars["ADMIN_PASSWORD"]}
 		}
 		return &Probe{Type: typ, Host: h, Port: p}
 	}
@@ -216,14 +225,13 @@ func (m *Monitor) probeFor(s clientServer) *Probe {
 			if spec.Type == "none" {
 				return nil
 			}
+			if spec.Type == "palworld" && spec.Port == 0 {
+				spec.Port = portVar("RCON_PORT")
+			}
 			return build(spec.Type, spec.URL, spec.Host, spec.Port)
 		}
 	}
 
-	vars := map[string]string{}
-	for _, v := range s.Relationships.Variables.Data {
-		vars[v.Attributes.Env] = v.Attributes.Value
-	}
 	hay := strings.ToLower(s.Invocation + " " + s.DockerImage + " " + s.Relationships.Egg.Attributes.Name)
 	has := func(words ...string) bool {
 		for _, w := range words {
@@ -233,10 +241,30 @@ func (m *Monitor) probeFor(s clientServer) *Probe {
 		}
 		return false
 	}
+	_, hasJar := vars["SERVER_JARFILE"]
 	switch {
 	case has("rustdedicated"): // Rust answers Steam queries on its query port
-		q, _ := strconv.Atoi(vars["QUERY_PORT"])
-		return build("a2s", "", "", q)
+		return build("a2s", "", "", portVar("QUERY_PORT"))
+	case has("valheim"):
+		if vars["ENABLE_CROSSPLAY"] == "1" || port == 0 {
+			return nil // crossplay servers are reached through PlayFab and answer nothing locally
+		}
+		return build("a2s", "", "", port+1) // Steam query port is the game port + 1
+	case has("enshrouded"):
+		if q := portVar("QUERY_PORT"); q != 0 || port == 0 {
+			return build("a2s", "", "", q)
+		}
+		return build("a2s", "", "", port+1)
+	case has("projectzomboid", "project zomboid"):
+		return build("a2s", "", "", 0)
+	case has("palserver", "palworld"): // nothing unauthenticated to ask; use its RCON port
+		if p := portVar("RCON_PORT"); p != 0 {
+			return build("palworld", "", "", p)
+		}
+	case has("dontstarve", "don't starve"):
+		return build("raknet", "", "", 0)
+	case hasJar && has("java"): // Minecraft: Java Edition and the proxies in front of it
+		return build("minecraft", "", "", 0)
 	case has("srcds"): // Source engine games answer on the game port
 		return build("a2s", "", "", 0)
 	case has("nginx", "apache", "httpd", "caddy", "lighttpd"):
@@ -296,37 +324,4 @@ func (m *Monitor) serverPower(ctx context.Context, identifier string) (string, e
 		return "", fmt.Errorf("unexpected panel response")
 	}
 	return resp.Attributes.State, nil
-}
-
-func (m *Monitor) probe(ctx context.Context, p *Probe) result {
-	switch p.Type {
-	case "http":
-		code, _, ms, err := m.get(ctx, false, p.URL, nil)
-		switch {
-		case err != nil:
-			return failResult(ms, "HTTP check failed: "+errDetail(err))
-		case code >= 400:
-			return failResult(ms, fmt.Sprintf("HTTP %d", code))
-		}
-		return okResult(ms, fmt.Sprintf("HTTP %d", code))
-	case "tcp":
-		addr := net.JoinHostPort(p.Host, strconv.Itoa(p.Port))
-		start := time.Now()
-		conn, err := (&net.Dialer{Timeout: m.cfg.Timeout}).DialContext(ctx, "tcp", addr)
-		ms := time.Since(start).Milliseconds()
-		if err != nil {
-			return failResult(ms, fmt.Sprintf("port %d not accepting connections: %s", p.Port, errDetail(err)))
-		}
-		conn.Close()
-		return okResult(ms, fmt.Sprintf("port %d open", p.Port))
-	case "a2s":
-		start := time.Now()
-		info, err := a2sInfo(net.JoinHostPort(p.Host, strconv.Itoa(p.Port)), m.cfg.Timeout)
-		ms := time.Since(start).Milliseconds()
-		if err != nil {
-			return failResult(ms, "no answer to server query: "+errDetail(err))
-		}
-		return okResult(ms, info)
-	}
-	return result{kind: resSkip, detail: "unknown check type " + p.Type}
 }
