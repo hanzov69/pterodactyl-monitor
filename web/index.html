@@ -150,7 +150,9 @@ const ico = s => `<span class="ico ${s}" aria-hidden="true">${ICON[s] || "?"}</s
 const pct = v => v == null ? "–" : (v >= 99.995 ? "100" : v.toFixed(v >= 99 ? 2 : 1)) + "%";
 const dtf = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const tf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-const isOutage = t => t.status === "down" && (t.kind !== "server" || t.announced);
+// A server that has never been seen up (already off when discovered) is "off", not a problem.
+const neverUp = t => t.kind === "server" && !t.seenUp;
+const isOutage = t => t.status === "down" && !neverUp(t);
 const inTab = (t, which) => (t.kind === "server") === (which === "servers");
 
 function dur(sec) {
@@ -166,8 +168,7 @@ function dur(sec) {
 function display(t) {
   if (t.stale) return { cls: "unknown", label: "Unknown" };
   if (t.status === "starting") return { cls: "starting", label: cap(t.power || "starting") };
-  // A server that was already off when first discovered is "off", not an outage.
-  if (t.status === "down" && t.kind === "server" && !t.announced) return { cls: "idle", label: t.power === "offline" ? "Offline" : "Down" };
+  if (neverUp(t) && (t.status === "down" || t.status === "failing")) return { cls: "idle", label: t.power === "offline" ? "Offline" : "Down" };
   if (t.status === "down" && t.power === "offline") return { cls: "down", label: "Offline" };
   if (LABEL[t.status]) return { cls: t.status, label: LABEL[t.status] };
   return { cls: "idle", label: cap(String(t.status).replace(/_/g, " ")) }; // suspended, installing, ...
@@ -186,7 +187,7 @@ function render(s) {
   // Targets with alerts switched off don't count towards the headline.
   const watched = s.targets.filter(t => t.alerts);
   const down = watched.filter(isOutage);
-  const failing = watched.filter(t => t.status === "failing");
+  const failing = watched.filter(t => t.status === "failing" && !neverUp(t));
   const mutedDown = s.targets.filter(t => !t.alerts && isOutage(t)).length;
   const stale = s.lastCycle.startsWith("0001") ? false : now - new Date(s.lastCycle).getTime() > s.intervalSec * 3000 + 60000;
 
