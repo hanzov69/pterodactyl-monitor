@@ -112,8 +112,8 @@ func (m *Monitor) listServers(ctx context.Context) ([]Target, result) {
 			Kind:       "server",
 			Identifier: s.Identifier,
 			Node:       s.Node,
-			Probe:      m.probeFor(s),
 		}
+		t.Probe, t.Tags, t.Note = m.describe(s)
 		t.URL = t.Probe.String()
 		switch {
 		case s.Suspended:
@@ -186,11 +186,13 @@ func (s clientServer) endpoint() (string, int) {
 	return s.SFTP.IP, 0
 }
 
-// probeFor picks the service check for a server: an explicit SERVER_CHECKS
-// entry (matched by name, short id or UUID) wins; otherwise a check is chosen
-// for server types that are recognised. Unrecognised servers are judged on
-// their power state alone.
-func (m *Monitor) probeFor(s clientServer) *Probe {
+// describe works out, from what the panel knows about a server, which
+// service check it gets plus anything worth showing next to it.
+//
+// The check is an explicit SERVER_CHECKS entry (matched by name, short id or
+// UUID) if there is one; otherwise one is chosen for server types that are
+// recognised. Unrecognised servers are judged on their power state alone.
+func (m *Monitor) describe(s clientServer) (probe *Probe, tags []string, note string) {
 	host, port := s.endpoint()
 	vars := map[string]string{}
 	for _, v := range s.Relationships.Variables.Data {
@@ -200,6 +202,25 @@ func (m *Monitor) probeFor(s clientServer) *Probe {
 		n, _ := strconv.Atoi(vars[name])
 		return n
 	}
+	hay := strings.ToLower(s.Invocation + " " + s.DockerImage + " " + s.Relationships.Egg.Attributes.Name)
+	has := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(hay, w) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Valheim's crossplay switch decides how the server can be reached at
+	// all, so it is shown. This is the panel's setting: it takes effect the
+	// next time the server starts.
+	crossplay := false
+	if v, ok := vars["ENABLE_CROSSPLAY"]; ok && has("valheim") {
+		crossplay = v == "1" || strings.EqualFold(v, "true")
+		tags = append(tags, map[bool]string{true: "crossplay on", false: "crossplay off"}[crossplay])
+	}
+
 	build := func(typ, rawURL, h string, p int) *Probe {
 		if h == "" {
 			h = host
@@ -223,68 +244,83 @@ func (m *Monitor) probeFor(s clientServer) *Probe {
 	for _, key := range []string{s.Name, s.Identifier, s.UUID} {
 		if spec, ok := m.cfg.ServerChecks[strings.ToLower(key)]; ok && key != "" {
 			if spec.Type == "none" {
-				return nil
+				return nil, tags, ""
 			}
 			if spec.Type == "palworld" && spec.Port == 0 {
 				spec.Port = portVar("RCON_PORT")
 			}
-			return build(spec.Type, spec.URL, spec.Host, spec.Port)
+			return build(spec.Type, spec.URL, spec.Host, spec.Port), tags, ""
 		}
 	}
 
-	hay := strings.ToLower(s.Invocation + " " + s.DockerImage + " " + s.Relationships.Egg.Attributes.Name)
-	has := func(words ...string) bool {
-		for _, w := range words {
-			if strings.Contains(hay, w) {
-				return true
-			}
-		}
-		return false
-	}
 	_, hasJar := vars["SERVER_JARFILE"]
 	switch {
 	case has("rustdedicated"): // Rust answers Steam queries on its query port
-		return build("a2s", "", "", portVar("QUERY_PORT"))
+		probe = build("a2s", "", "", portVar("QUERY_PORT"))
 	case has("valheim"):
-		if vars["ENABLE_CROSSPLAY"] == "1" || port == 0 {
-			return nil // crossplay servers are reached through PlayFab and answer nothing locally
+		switch {
+		case crossplay: // reached through PlayFab; answers nothing locally
+			note = "no Steam query while crossplay is on"
+		case port != 0:
+			probe = build("a2s", "", "", port+1) // Steam query port is the game port + 1
 		}
-		return build("a2s", "", "", port+1) // Steam query port is the game port + 1
 	case has("enshrouded"):
 		if q := portVar("QUERY_PORT"); q != 0 || port == 0 {
-			return build("a2s", "", "", q)
+			probe = build("a2s", "", "", q)
+		} else {
+			probe = build("a2s", "", "", port+1)
 		}
-		return build("a2s", "", "", port+1)
 	case has("projectzomboid", "project zomboid"):
-		return build("a2s", "", "", 0)
+		probe = build("a2s", "", "", 0)
 	case has("palserver", "palworld"): // nothing unauthenticated to ask; use its RCON port
 		if p := portVar("RCON_PORT"); p != 0 {
-			return build("palworld", "", "", p)
+			probe = build("palworld", "", "", p)
 		}
 	case has("dontstarve", "don't starve"):
-		return build("raknet", "", "", 0)
+		probe = build("raknet", "", "", 0)
 	case hasJar && has("java"): // Minecraft: Java Edition and the proxies in front of it
-		return build("minecraft", "", "", 0)
+		probe = build("minecraft", "", "", 0)
 	case has("srcds"): // Source engine games answer on the game port
-		return build("a2s", "", "", 0)
+		probe = build("a2s", "", "", 0)
 	case has("nginx", "apache", "httpd", "caddy", "lighttpd"):
-		return build("http", "", "", 0)
+		probe = build("http", "", "", 0)
 	}
-	return nil
+	return probe, tags, note
 }
 
 // checkServer combines the panel's view of a server (its power state) with
 // the server's own service check, if it has one.
+//
+// A service check is only held against a server once that exact check has
+// passed at least once. Until then a failing check is reported but the server
+// is judged on its power state, so a check that cannot work for this server
+// (wrongly detected, port not reachable, a setting that only takes effect
+// after a restart) never turns a running server into an outage.
 func (m *Monitor) checkServer(ctx context.Context, s Target) result {
+	confirmed := false
+	if s.Probe != nil {
+		m.mu.Lock()
+		if st := m.d.States[s.ID]; st != nil {
+			confirmed = st.ProbeConfirmed && st.ProbeKey == s.Probe.String()
+		}
+		m.mu.Unlock()
+	}
+	unconfirmed := func(r result) string { return "check has not passed yet (" + r.detail + ")" }
+
 	power, err := m.serverPower(ctx, s.Identifier)
 	switch {
 	case err != nil:
 		// The panel couldn't reach the node. The service may still be fine, so
 		// let its own check decide; without one there is nothing to go on.
+		unavailable := "state unavailable: " + err.Error()
 		if s.Probe == nil {
-			return result{kind: resSkip, detail: "state unavailable: " + err.Error()}
+			return result{kind: resSkip, detail: unavailable}
 		}
 		r := m.probe(ctx, s.Probe)
+		r.probePassed = r.kind == resOK
+		if r.kind != resOK && !confirmed {
+			return result{kind: resSkip, detail: unavailable + " · " + unconfirmed(r)}
+		}
 		r.detail = "state unavailable · " + r.detail
 		return r
 	case power == "running":
@@ -292,12 +328,15 @@ func (m *Monitor) checkServer(ctx context.Context, s Target) result {
 			return result{kind: resOK, detail: "running", power: power}
 		}
 		r := m.probe(ctx, s.Probe)
-		if r.kind == resOK {
+		r.power, r.probePassed = power, r.kind == resOK
+		switch {
+		case r.kind == resOK:
 			r.detail = "running · " + r.detail
-		} else {
+		case !confirmed:
+			r = result{kind: resOK, power: power, detail: "running · " + unconfirmed(r)}
+		default:
 			r.detail = "running, but " + r.detail
 		}
-		r.power = power
 		return r
 	case power == "starting" || power == "stopping":
 		return result{kind: resPending, detail: power, power: power}
@@ -305,7 +344,6 @@ func (m *Monitor) checkServer(ctx context.Context, s Target) result {
 		return result{kind: resFail, detail: power, power: power}
 	}
 }
-
 func (m *Monitor) serverPower(ctx context.Context, identifier string) (string, error) {
 	u := fmt.Sprintf("%s/api/client/servers/%s/resources", m.cfg.APIURL, identifier)
 	code, body, _, err := m.get(ctx, m.cfg.LANInsecure, u, bearer(m.cfg.ClientKey))

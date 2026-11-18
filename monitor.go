@@ -73,10 +73,12 @@ type Target struct {
 	Maintenance bool   `json:"maintenance,omitempty"`
 
 	// Servers only.
-	Identifier string `json:"identifier,omitempty"` // panel short id
-	Node       string `json:"node,omitempty"`
-	Idle       string `json:"idle,omitempty"` // suspended, installing, ...: shown, never checked
-	Probe      *Probe `json:"probe,omitempty"`
+	Identifier string   `json:"identifier,omitempty"` // panel short id
+	Node       string   `json:"node,omitempty"`
+	Idle       string   `json:"idle,omitempty"` // suspended, installing, ...: shown, never checked
+	Probe      *Probe   `json:"probe,omitempty"`
+	Tags       []string `json:"tags,omitempty"` // settings worth showing, e.g. "crossplay on"
+	Note       string   `json:"note,omitempty"` // why a server has no service check, when that needs saying
 }
 
 // Label is the name used in emails and the event log.
@@ -101,6 +103,11 @@ type State struct {
 	SeenUp       bool      `json:"seenUp,omitempty"`
 	Announced    bool      `json:"announced,omitempty"` // current outage is in the event log
 	Notified     bool      `json:"notified,omitempty"`  // current outage was emailed
+
+	// A server's service check only counts against it once that exact check
+	// has passed at least once; see checkServer.
+	ProbeKey       string `json:"probeKey,omitempty"`
+	ProbeConfirmed bool   `json:"probeConfirmed,omitempty"`
 }
 
 type Bucket struct {
@@ -144,10 +151,11 @@ const (
 )
 
 type result struct {
-	kind   outcome
-	ms     int64
-	detail string
-	power  string
+	kind        outcome
+	ms          int64
+	detail      string
+	power       string
+	probePassed bool // the server's service check ran and passed
 }
 
 func okResult(ms int64, detail string) result   { return result{kind: resOK, ms: ms, detail: detail} }
@@ -393,6 +401,12 @@ func (m *Monitor) apply(t Target, r result, now time.Time) {
 	st := m.state(t.ID, now)
 	st.LastCheck, st.Detail, st.Power = now, r.detail, r.power
 	st.Stale = r.kind == resSkip
+	if key := t.Probe.String(); st.ProbeKey != key { // check added, removed or pointed elsewhere
+		st.ProbeKey, st.ProbeConfirmed = key, false
+	}
+	if r.probePassed {
+		st.ProbeConfirmed = true
+	}
 	if r.kind == resSkip {
 		return
 	}

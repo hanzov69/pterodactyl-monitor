@@ -55,6 +55,8 @@
   .row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
   .name { font-weight: 600; }
   .sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .tag { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 500;
+    line-height: 17px; color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--border); vertical-align: 1px; white-space: nowrap; }
   .right { display: flex; gap: 20px; text-align: right; white-space: nowrap; }
   .target.muted .name, .target.muted .pct { color: var(--ink-2); }
 
@@ -220,11 +222,12 @@ function render(s) {
   document.getElementById("targets").innerHTML = shown.map((t, ti) => {
     const d = display(t);
     const since = t.status === "unknown" || t.stale ? "" : ` for ${dur((now - new Date(t.since).getTime()) / 1000)}`;
-    const info = [t.node ? `on ${t.node}` : "", t.url, t.detail, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
+    const info = [t.node ? `on ${t.node}` : "", t.url, t.detail, t.note, t.status === "up" && t.latencyMs ? `${t.latencyMs} ms` : ""].filter(Boolean).map(esc).join(" · ");
+    const tags = (t.tags || []).map(x => `<span class="tag">${esc(x)}</span>`).join("");
     const strip = t.cells.map((c, ci) => { cells[`${ti}:${ci}`] = c; return `<div class="cell ${cellClass(c)}" data-c="${ti}:${ci}"></div>`; }).join("");
     return `<div class="target${t.alerts ? "" : " muted"}">
       <div class="row">
-        <div><span class="name">${esc(t.name)}</span><span class="badge">${ico(d.cls)}${esc(d.label)}${since}</span>
+        <div><span class="name">${esc(t.name)}</span><span class="badge">${ico(d.cls)}${esc(d.label)}${since}</span>${tags}
           <div class="sub">${info}</div></div>
         <div class="right">
           <div><div class="pct">${pct(t.uptime[s.range])}</div><div class="sub">uptime</div></div>

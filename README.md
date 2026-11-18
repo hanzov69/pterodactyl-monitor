@@ -123,7 +123,7 @@ defines.
 | Server type | Check | Where it connects | What has to be true |
 |---|---|---|---|
 | Rust | `a2s` | The egg's `QUERY_PORT` variable (else the primary port), UDP | - |
-| Valheim | `a2s` | Primary port + 1, UDP | Crossplay off. Crossplay servers go through PlayFab and answer nothing locally, so they get no check |
+| Valheim | `a2s` | Primary port + 1, UDP | Crossplay off (the egg's `ENABLE_CROSSPLAY` variable). Crossplay servers go through PlayFab and answer nothing locally, so they are judged on power state. The setting is shown next to the server as `crossplay on` / `crossplay off` |
 | Enshrouded | `a2s` | The egg's `QUERY_PORT` variable (else primary port + 1), UDP | - |
 | Project Zomboid | `a2s` | Primary port, UDP | - |
 | Source engine (`srcds`) | `a2s` | Primary port, UDP | - |
@@ -177,9 +177,14 @@ SERVER_CHECKS={"My Website":{"type":"http","url":"https://www.example.com"},"1a2
 ```
 
 The dashboard shows which check each server ended up with (for example
-`a2s://10.0.0.5:28016`) and, when it fails, why (`running, but no answer to
-server query: timed out`), which is the quickest way to see whether a port or
-host needs overriding.
+`a2s://10.0.0.5:28016`) and, when it fails, why (`no answer to server query:
+timed out`), which is the quickest way to see whether a port or host needs
+overriding.
+
+Settings shown on the dashboard, like Valheim's crossplay, are read from the
+panel's startup variables. They describe how the server is configured to
+start, so a change shows up immediately but only takes effect on the server
+after its next restart.
 
 ### How a server's status is decided
 
@@ -189,9 +194,15 @@ host needs overriding.
   booting does.
 - A server that is already off when the monitor first sees it is shown as
   offline without being reported; it is only treated as an outage once it has
-  been seen up. The same applies to a service check that has never passed, so
-  a wrongly detected check shows as down but never emails you (set it to
-  `none` or the right type in `SERVER_CHECKS`).
+  been seen up.
+- A service check only counts against a server once that exact check has
+  passed at least once. Until then a running server stays up and its row says
+  `check has not passed yet (...)` with the reason. So a check that can't
+  work - wrongly detected, an unreachable port, or a setting such as Valheim's
+  crossplay changed in the panel but not yet applied by a restart - never
+  raises an alert. Changing a server's check (or a panel setting that changes
+  it) starts this over. If the note doesn't go away, fix the check in
+  `SERVER_CHECKS` or set it to `none`.
 - Suspended and installing servers are shown but never alerted on.
 - If the panel can't report a server's state (node unreachable), the service
   check decides on its own; without one the server is shown as unknown.
